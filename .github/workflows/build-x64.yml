@@ -1,0 +1,137 @@
+name: Build x64
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-x64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONFIGURATION: Release
+  PLATFORM: x64
+  SOLUTION: TrayS.sln
+
+jobs:
+  build:
+    name: MSBuild Release|x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Cache MSBuild intermediates and outputs
+        uses: actions/cache@v4
+        with:
+          # Workspace path is stable across runs (D:\a\<repo>\<repo>), so
+          # restoring obj/tlog speeds up incremental MSBuild rebuilds.
+          path: |
+            x64
+            Bin
+            TrayS\x64
+            TrayS\Release
+            OpenHardwareMonitorApi\x64
+            OpenHardwareMonitorApi\Release
+            **\*.tlog
+            **\*.obj
+            **\*.iobj
+            **\*.ipdb
+            **\*.pch
+            **\*.pdb
+          key: msbuild-${{ env.PLATFORM }}-${{ env.CONFIGURATION }}-${{ runner.os }}-${{ hashFiles('**/*.{cpp,h,hpp,c,rc,vcxproj,sln,filters,dll,lib}') }}
+          restore-keys: |
+            msbuild-${{ env.PLATFORM }}-${{ env.CONFIGURATION }}-${{ runner.os }}-
+
+      - name: Build OpenHardwareMonitorApi (x64)
+        shell: pwsh
+        run: |
+          msbuild "OpenHardwareMonitorApi\OpenHardwareMonitorApi.vcxproj" `
+            /m `
+            /restore:false `
+            /p:Configuration=${{ env.CONFIGURATION }} `
+            /p:Platform=${{ env.PLATFORM }} `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0 `
+            /p:TargetFrameworkVersion=v4.8 `
+            /p:UseMultiToolTask=true `
+            /p:EnforceProcessCountAcrossBuilds=true `
+            /p:CL_MPCount=4 `
+            /v:minimal `
+            /nologo
+
+      - name: Build TrayS (x64)
+        shell: pwsh
+        run: |
+          msbuild "TrayS\TrayS.vcxproj" `
+            /m `
+            /restore:false `
+            /p:Configuration=${{ env.CONFIGURATION }} `
+            /p:Platform=${{ env.PLATFORM }} `
+            /p:PlatformToolset=v143 `
+            /p:WindowsTargetPlatformVersion=10.0 `
+            /p:UseMultiToolTask=true `
+            /p:EnforceProcessCountAcrossBuilds=true `
+            /p:CL_MPCount=4 `
+            /v:minimal `
+            /nologo
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $out = "dist\TrayS-x64-${{ env.CONFIGURATION }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $candidates = @(
+            "TrayS\x64\${{ env.CONFIGURATION }}\TrayS.exe",
+            "x64\${{ env.CONFIGURATION }}\TrayS.exe",
+            "TrayS\${{ env.CONFIGURATION }}\TrayS.exe"
+          )
+          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "TrayS.exe not found. Searching..."
+            Get-ChildItem -Recurse -Filter TrayS.exe -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+            throw "TrayS.exe missing after build"
+          }
+          Copy-Item $exe $out
+
+          $dllCandidates = @(
+            "x64\${{ env.CONFIGURATION }}\OpenHardwareMonitorApi.dll",
+            "OpenHardwareMonitorApi\x64\${{ env.CONFIGURATION }}\OpenHardwareMonitorApi.dll",
+            "Bin\${{ env.PLATFORM }}\${{ env.CONFIGURATION }}\OpenHardwareMonitorApi.dll"
+          )
+          $dll = $dllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $dll) {
+            Get-ChildItem -Recurse -Filter OpenHardwareMonitorApi.dll -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+            throw "OpenHardwareMonitorApi.dll missing after build"
+          }
+          Copy-Item $dll $out
+          Copy-Item "OpenHardwareMonitorApi\LibreHardwareMonitorLib.dll" $out
+          Copy-Item "TrayS\WinRing0x64.sys" $out -ErrorAction SilentlyContinue
+
+          # Optional companion import lib if produced next to the DLL
+          $lib = Join-Path (Split-Path $dll) "OpenHardwareMonitorApi.lib"
+          if (Test-Path $lib) { Copy-Item $lib $out }
+
+          Get-ChildItem $out | Format-Table Name, Length -AutoSize
+          Write-Host "Staged from exe=$exe dll=$dll"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayS-x64-${{ env.CONFIGURATION }}
+          path: dist/TrayS-x64-${{ env.CONFIGURATION }}/
+          if-no-files-found: error
+          retention-days: 30
