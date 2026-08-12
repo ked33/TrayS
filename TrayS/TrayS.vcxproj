@@ -198,9 +198,9 @@
       </HeapReserveSize>
       <StackReserveSize>
       </StackReserveSize>
-      <!-- Freestanding-style Release: CRT stubs live in framework.h; no UCRT. -->
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;comctl32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <DelayLoadDLLs>user32.dll;gdi32.dll;advapi32.dll;OLEAUT32.dll;ole32.dll;</DelayLoadDLLs>
+      <!-- Freestanding-style Release: CRT stubs in framework.h; no UCRT/delayimp. -->
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs></DelayLoadDLLs>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <MergeSections>.rdata=.text</MergeSections>
       <EntryPointSymbol>
@@ -211,7 +211,7 @@
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
       <MinimumRequiredVersion>6.00</MinimumRequiredVersion>
-      <SupportUnloadOfDelayLoadedDLL>true</SupportUnloadOfDelayLoadedDLL>
+      <SupportUnloadOfDelayLoadedDLL>false</SupportUnloadOfDelayLoadedDLL>
     </Link>
     <Manifest>
       <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
