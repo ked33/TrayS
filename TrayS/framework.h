@@ -57,6 +57,23 @@ void* __cdecl memcpy(void* pDest, const void* pSrc, size_t cb)
 	}
 	return pResult;
 }
+// Provide CRT string helpers used by the Release freestanding-style link.
+#pragma function(strlen)
+size_t __cdecl strlen(const char* s)
+{
+	const char* p = s;
+	while (*p)
+		++p;
+	return (size_t)(p - s);
+}
+#pragma function(wcslen)
+size_t __cdecl wcslen(const wchar_t* s)
+{
+	const wchar_t* p = s;
+	while (*p)
+		++p;
+	return (size_t)(p - s);
+}
 #endif
 #if __cplusplus
 extern "C"

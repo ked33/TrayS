@@ -198,10 +198,10 @@
       </HeapReserveSize>
       <StackReserveSize>
       </StackReserveSize>
-      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Freestanding-style Release: CRT stubs live in framework.h; no UCRT. -->
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;comctl32.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <DelayLoadDLLs>user32.dll;gdi32.dll;advapi32.dll;OLEAUT32.dll;ole32.dll;</DelayLoadDLLs>
-      <IgnoreAllDefaultLibraries>
-      </IgnoreAllDefaultLibraries>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <MergeSections>.rdata=.text</MergeSections>
       <EntryPointSymbol>
       </EntryPointSymbol>
@@ -210,7 +210,7 @@
       <LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
-      <MinimumRequiredVersion>5.01</MinimumRequiredVersion>
+      <MinimumRequiredVersion>6.00</MinimumRequiredVersion>
       <SupportUnloadOfDelayLoadedDLL>true</SupportUnloadOfDelayLoadedDLL>
     </Link>
     <Manifest>
