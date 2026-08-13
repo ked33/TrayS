@@ -39,6 +39,12 @@
     <ClInclude Include="Function.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessMonitor.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessMonitorResource.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="TrayS.cpp">
@@ -47,9 +53,18 @@
     <ClCompile Include="Function.cpp">
       <Filter>头文件</Filter>
     </ClCompile>
+    <ClCompile Include="ProcessMonitor.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="TrayS.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
+    <ResourceCompile Include="ProcessMonitor.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
+    <ResourceCompile Include="TipsSetting.rc">
       <Filter>资源文件</Filter>
     </ResourceCompile>
   </ItemGroup>

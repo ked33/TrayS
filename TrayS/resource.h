@@ -20,6 +20,7 @@
 #define IDD_TIME                        133
 #define IDR_MENU                        134
 #define IDI_CLOSE1                      141
+#define IDD_TIPS_SETTING                143
 #define IDC_RADIO_DEFAULT               1001
 #define IDC_RADIO_TRANSPARENT           1002
 #define IDC_RADIO_BLURBEHIND            1003
@@ -107,6 +108,16 @@
 #define IDC_BUTTON_COLOR_LOW            1099
 #define IDC_BUTTON_COLOR_MEDUIM         1100
 #define IDC_BUTTON_COLOR_HIGH           1101
+#define IDC_TIPS_TRAFFIC_ENABLE         1110
+#define IDC_TIPS_TRAFFIC_ROWS           1111
+#define IDC_TIPS_CPU_ENABLE             1112
+#define IDC_TIPS_CPU_ROWS               1113
+#define IDC_TIPS_MEMORY_ENABLE          1114
+#define IDC_TIPS_MEMORY_ROWS            1115
+#define IDC_TIPS_VISIBLE_ROWS           1116
+#define IDC_TIPS_CHOOSE_FONT            1117
+#define IDC_TIPS_SAVE                   1118
+#define IDC_TIPS_CANCEL                 1119
 #define ID_32800                        32800
 #define IDC_SELECT_ALL                  33000
 #define IDC_DISK_ALL                    33200
@@ -117,9 +128,9 @@
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NO_MFC                     1
-#define _APS_NEXT_RESOURCE_VALUE        143
+#define _APS_NEXT_RESOURCE_VALUE        144
 #define _APS_NEXT_COMMAND_VALUE         32802
-#define _APS_NEXT_CONTROL_VALUE         1083
+#define _APS_NEXT_CONTROL_VALUE         1120
 #define _APS_NEXT_SYMED_VALUE           110
 #endif
 #endif

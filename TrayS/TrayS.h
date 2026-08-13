@@ -75,6 +75,8 @@ void AddItem(LPWINDOW_INFO lpWindowInfo)
 */
 /////////////////////////////////////////////自定义网卡数据结构
 #define MAX_TRAFFIC_ADAPTERS 128
+#define MAX_TIPS_TRAFFIC_ROWS 64
+#define MAX_TIPS_PROCESS_ROWS 64
 typedef struct _TRAFFIC
 {
 	ULONG64 in_bytes;
@@ -104,6 +106,7 @@ typedef struct _PROCESSTIME
 {
 	DWORD dwProcessID;
 	LARGE_INTEGER g_slgProcessTimeOld;
+	DWORD dwSeenCycle;
 }PROCESSTIME;
 DWORD dNumProcessor = 0;//CPU数量
 HINSTANCE hInst;// 当前实例
@@ -242,9 +245,16 @@ typedef struct _TRAYSAVE//默认参数
 	WCHAR szDiskName[8];//硬盘名称
 	WCHAR szDisk;//盘符
 	BOOL bTrayStyle;//任务栏风格开关
+	BOOL bTipsTraffic;//提示窗口显示网络列表
+	BOOL bTipsCPU;//提示窗口显示CPU进程列表
+	BOOL bTipsMemory;//提示窗口显示内存进程列表
+	DWORD TipsTrafficRows;//网络列表最大行数
+	DWORD TipsCPURows;//CPU进程列表行数
+	DWORD TipsMemoryRows;//内存进程列表行数
+	DWORD TipsVisibleRows;//提示窗口上方可见行数
 }TRAYSAVE;
 TRAYSAVE TraySave = {
-	117,
+	118,
 	{ ACCENT_ENABLE_TRANSPARENTGRADIENT,ACCENT_ENABLE_BLURBEHIND } ,
 	{ 0x00111111,0x66000000 },{ 255,255 } ,
 	{ 10 * 1024 * 1024,64 * 1024 * 1024,66,96,81,96,61,88,98 * 1048576,88,0,0 } ,
@@ -293,7 +303,14 @@ TRAYSAVE TraySave = {
 	L"写入:",
 	L"硬盘:",
 	0,
-	TRUE
+	TRUE,
+	TRUE,
+	TRUE,
+	TRUE,
+	6,
+	6,
+	6,
+	13
 };
 TRAYSAVE MonitorSettings = { 0 };//仅由 UI 线程发布，工作线程读取的配置快照
 int wTraffic;//流量宽度
@@ -316,12 +333,12 @@ MEMORYSTATUSEX MemoryStatusEx;/////////////////虚拟内存/内存大小
 MEMORYSTATUSEX MemoryStatusSnapshot;
 DWORD CpuUsageSnapshot = 0;
 BOOL bTaskBarMoveing = FALSE;///////////////////窗口是否正在移动中
-PROCESSMEMORYUSAGE pmu[6];
-PROCESSCPUUSAGE pcu[6];
-PROCESSMEMORYUSAGE pmuWork[6];
-PROCESSMEMORYUSAGE *ppmuWork[6];
-PROCESSCPUUSAGE pcuWork[6];
-PROCESSCPUUSAGE *ppcuWork[6];
+PROCESSMEMORYUSAGE pmu[MAX_TIPS_PROCESS_ROWS];
+PROCESSCPUUSAGE pcu[MAX_TIPS_PROCESS_ROWS];
+PROCESSMEMORYUSAGE pmuWork[MAX_TIPS_PROCESS_ROWS];
+PROCESSMEMORYUSAGE *ppmuWork[MAX_TIPS_PROCESS_ROWS];
+PROCESSCPUUSAGE pcuWork[MAX_TIPS_PROCESS_ROWS];
+PROCESSCPUUSAGE *ppcuWork[MAX_TIPS_PROCESS_ROWS];
 int nProcess;
 PROCESSTIME * pProcessTime;
 int nProcessTimeCapacity = 0;
@@ -500,6 +517,7 @@ void AdjustWindowPos();//////////////////////////////////////////调整窗口大
 BOOL                InitInstance(HINSTANCE, int);//////////////////////////////////////初始化
 INT_PTR CALLBACK    MainProc(HWND, UINT, WPARAM, LPARAM);//主窗口过程
 INT_PTR CALLBACK    SettingProc(HWND, UINT, WPARAM, LPARAM);//设置窗口过程
+INT_PTR CALLBACK    TipsSettingProc(HWND, UINT, WPARAM, LPARAM);//提示窗口设置过程
 INT_PTR CALLBACK    TaskBarProc(HWND, UINT, WPARAM, LPARAM);//任务栏监控窗口过程
 INT_PTR CALLBACK    TaskTipsProc(HWND, UINT, WPARAM, LPARAM);//提示窗口过程
 INT_PTR CALLBACK    TimeProc(HWND, UINT, WPARAM, LPARAM);//秒窗口过程
@@ -509,7 +527,7 @@ int DrawShadowText(HDC hDC, LPCTSTR lpString, int nCount, LPRECT lpRect, UINT uF
 void FreeTemperatureDLL();//
 void LoadTemperatureDLL();//加载DLL
 void SetWH();//计算监控窗口高宽
-int GetProcessMemUsage();//获取内存使用大小
-void GetProcessCpuUsage();//获取进程CPU使用率
+int GetProcessMemUsage(int);//获取内存使用大小
+void GetProcessCpuUsage(int);//获取进程CPU使用率
 void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit,int iUnit=0);//流量转字符串
 void ShowSelectMenu(BOOL bNet);//显示网卡/硬盘菜单
