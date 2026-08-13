@@ -864,119 +864,38 @@ void SetTaskScheduler(BOOL bDelAdd, const WCHAR* szName)////////////////////////
 }
 BOOL AutoRun(BOOL GetSet, BOOL bAutoRun,const WCHAR* szName)//读取、设置开机启动、关闭开机启动
 {
-//	UninstallService();
 	BOOL ret = FALSE;
-/*
-	if (GetSet == FALSE)
-	{
-		WCHAR szExe[MAX_PATH];
-		GetSystemDirectory(szExe, MAX_PATH);
-		lstrcat(szExe, L"\\schtasks.exe");
-		DWORD               exitCode = 0;
-		PROCESS_INFORMATION pInfo = { 0 };
-		STARTUPINFO         sInfo = { 0 };
-		sInfo.cb = sizeof(STARTUPINFO);
-		sInfo.wShowWindow = SW_HIDE;
-		WCHAR szCommandLine[MAX_PATH];
-		lstrcpy(szCommandLine, L"/Query /TN ");
-		lstrcat(szCommandLine,szName);
-		if (CreateProcess(szExe, szCommandLine, NULL, NULL, FALSE, 0, NULL, NULL, &sInfo, &pInfo))
-		{
-			// Wait until child process exits.
-			WaitForSingleObject(pInfo.hProcess, INFINITE);
-
-			if (GetExitCodeProcess(pInfo.hProcess, &exitCode))
-			{
-				CloseHandle(pInfo.hProcess);
-				CloseHandle(pInfo.hThread);
-				if (exitCode == 0)
-					return TRUE;
-			}
-			else
-			{
-				CloseHandle(pInfo.hProcess);
-				CloseHandle(pInfo.hThread);
-			}
-		}
-	}
-*/
 	WCHAR sFileName[MAX_PATH];
 	sFileName[0] = L'\"';
 	GetModuleFileName(NULL, &sFileName[1], MAX_PATH);
 	int sLen = lstrlen(sFileName);
 	sFileName[sLen] = L'\"';
-	sFileName[sLen + 1] = L' ';
-	sFileName[sLen + 2] = L't';
-	sFileName[sLen + 3] = L'\0';
-	if (IsUserAdmin())
+	sFileName[sLen + 1] = L'\0';
+	HKEY pKey = NULL;
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", NULL, KEY_ALL_ACCESS, &pKey) == ERROR_SUCCESS)
 	{
 		if (GetSet)
 		{
-			HKEY pKey;
-			RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", NULL, KEY_ALL_ACCESS, &pKey);
-			if (pKey)
-			{
-				RegDeleteValue(pKey, szName);
-				RegCloseKey(pKey);
-			}
-			RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", NULL, KEY_ALL_ACCESS, &pKey);
-			if (pKey)
-			{
-				RegDeleteValue(pKey, szName);
-				RegCloseKey(pKey);
-			}
+			SetTaskScheduler(FALSE, szName);
+			if (IsServiceInstalled())
+				UninstallService();
 			if (bAutoRun)
-			{
-				SetTaskScheduler(TRUE, szName);
-				InstallService();
-			}
+				ret = RegSetValueEx(pKey, szName, 0, REG_SZ, (const BYTE*)sFileName, (DWORD)((lstrlen(sFileName) + 1) * sizeof(WCHAR))) == ERROR_SUCCESS;
 			else
 			{
-				SetTaskScheduler(FALSE, szName);
-				if (IsServiceInstalled())
-					UninstallService();
+				LSTATUS status = RegDeleteValue(pKey, szName);
+				ret = status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 			}
 		}
 		else
 		{
-			return IsServiceInstalled();
+			WCHAR nFileName[MAX_PATH];
+			DWORD cbData = sizeof(nFileName);
+			DWORD dType = REG_SZ;
+			if (RegQueryValueEx(pKey, szName, NULL, &dType, (LPBYTE)nFileName, &cbData) == ERROR_SUCCESS)
+				ret = dType == REG_SZ && lstrcmp(sFileName, nFileName) == 0;
 		}
-	}
-	else
-	{
-		HKEY pKey;
-		RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", NULL, KEY_ALL_ACCESS, &pKey);
-		if (pKey)
-		{
-			if (GetSet)
-			{
-				if (bAutoRun)
-				{
-					SetTaskScheduler(TRUE, szName);
-					RegSetValueEx(pKey, szName, NULL, REG_SZ, (BYTE*)sFileName, (DWORD)lstrlen(sFileName) * 2);
-				}
-				else
-				{
-					SetTaskScheduler(FALSE, szName);
-					RegDeleteValue(pKey, szName);
-				}
-				ret = TRUE;
-			}
-			else
-			{
-				WCHAR nFileName[MAX_PATH];
-				DWORD cbData = MAX_PATH * sizeof WCHAR;
-				DWORD dType = REG_SZ;
-				if (RegQueryValueEx(pKey, szName, NULL, &dType, (LPBYTE)nFileName, &cbData) == ERROR_SUCCESS)
-				{
-					if (lstrcmp(sFileName, nFileName) == 0)
-						ret = TRUE;
-					else
-						ret = FALSE;
-				}
-			}
-			RegCloseKey(pKey);
-		}
+		RegCloseKey(pKey);
 	}
 	return ret;
 }
@@ -1479,244 +1398,6 @@ UINT pGetDpiForWindow(HWND hWnd)
 	}
 */
 }
-HMODULE hWinHttp = NULL;
-pfnWinHttpOpen winHttpOpen;
-pfnWinHttpConnect winHttpConnect;
-pfnWinHttpOpenRequest winHttpOpenRequest;
-pfnWinHttpSendRequest winHttpSendRequest;
-pfnWinHttpReceiveResponse winHttpReceiveResponse;
-pfnWinHttpQueryDataAvailable winHttpQueryDataAvailable;
-pfnWinHttpReadData winHttpReadData;
-pfnWinHttpCloseHandle winHttpCloseHandle;
-BOOL LoadWinHttp()
-{
-	hWinHttp = LoadLibrary(L"WinHttp.dll");
-	if (hWinHttp)
-	{
-		winHttpOpen = (pfnWinHttpOpen)GetProcAddress(hWinHttp, "WinHttpOpen");
-		winHttpConnect = (pfnWinHttpConnect)GetProcAddress(hWinHttp, "WinHttpConnect");
-		winHttpOpenRequest = (pfnWinHttpOpenRequest)GetProcAddress(hWinHttp, "WinHttpOpenRequest");
-		winHttpSendRequest = (pfnWinHttpSendRequest)GetProcAddress(hWinHttp, "WinHttpSendRequest");
-		winHttpReceiveResponse = (pfnWinHttpReceiveResponse)GetProcAddress(hWinHttp, "WinHttpReceiveResponse");
-		winHttpQueryDataAvailable = (pfnWinHttpQueryDataAvailable)GetProcAddress(hWinHttp, "WinHttpQueryDataAvailable");
-		winHttpReadData = (pfnWinHttpReadData)GetProcAddress(hWinHttp, "WinHttpReadData");
-		winHttpCloseHandle = (pfnWinHttpCloseHandle)GetProcAddress(hWinHttp, "WinHttpCloseHandle");
-		return TRUE;
-	}
-	return FALSE;
-}
-BOOL GetOKXFloat(char* szBuffer, float* fOut, WCHAR* szOut, char* sz)
-{
-	char* x = xstrstr(szBuffer, sz);
-	if (x)
-	{
-		char* l = xstrstr(x, ":");
-		if (l)
-		{
-			l += 2;
-			char* r = xstrstr(l, "\"");
-			if (r)
-			{
-				r[0] = '\0';
-				if (szOut)
-					MultiByteToWideChar(CP_UTF8, 0, l, -1, szOut, 16);
-				*fOut = xatof(l);
-				r[0] = '\"';
-				return TRUE;
-			}
-		}
-	}
-	return FALSE;
-}
-BOOL GetOKXPrice(LPTSTR szName, LPTSTR szWeb, float* fOutLast, float* fOutOpen, WCHAR* szOutLast, WCHAR* szOutOpen)
-{
-	if (hWinHttp == NULL)
-	{
-		if (!LoadWinHttp())
-			return FALSE;
-	}
-	DWORD dwSize = 0;
-	DWORD dwDownloaded = 0;
-	char pszOutBuffer[512];
-	BOOL  bResults = FALSE;
-	HINTERNET  hSession = NULL,hConnect = NULL,hRequest = NULL;
-
-	// Use WinHttpOpen to obtain a session handle.
-	hSession = winHttpOpen(L"Price", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, NULL);
-
-	//hSession = WinHttpOpen( L"WinHTTP Example/1.0",  
-	//                        WINHTTP_ACCESS_TYPE_NO_PROXY,
-	//                        WINHTTP_NO_PROXY_NAME, 
-	//                        WINHTTP_NO_PROXY_BYPASS, 0 );
-
-	// Specify an HTTP server.
-	if (hSession)
-		hConnect = winHttpConnect(hSession, szWeb,
-			INTERNET_DEFAULT_PORT, 0);
-	WCHAR szGet[256] = L"/api/v5/market/ticker?instId=";
-	lstrcat(szGet, szName);
-	// Create an HTTP request handle.
-	if (hConnect)
-		hRequest = winHttpOpenRequest(hConnect, L"GET", szGet,NULL, L"https://www.okx.com/",WINHTTP_DEFAULT_ACCEPT_TYPES,WINHTTP_FLAG_REFRESH);
-
-	// Send a request.
-	if (hRequest)
-		bResults = winHttpSendRequest(hRequest,WINHTTP_NO_ADDITIONAL_HEADERS, 0,WINHTTP_NO_REQUEST_DATA, 0,0, 0);
-
-
-	// End the request.
-	if (bResults)
-		bResults = winHttpReceiveResponse(hRequest, NULL);
-	
-	// Keep checking for data until there is nothing left.
-	size_t i = 0;
-	ZeroMemory(pszOutBuffer, 512);
-	if (bResults)
-	{
-		do
-		{
-			dwSize = 0;
-			winHttpQueryDataAvailable(hRequest, &dwSize);
-			if (!dwSize)
-				break;
-			if (i+dwSize > 511)
-				dwSize = 511-i;
-			if (winHttpReadData(hRequest, (LPVOID)&pszOutBuffer[i], dwSize, &dwDownloaded))
-			{
-				i = strlen(pszOutBuffer);
-			}
-			if (!dwDownloaded)
-				break;
-		} while (dwSize != 0);
-		char szLast[] = "last";
-		char szsodUtc8[] = "sodUtc8";
-		bResults = GetOKXFloat(pszOutBuffer, fOutLast, szOutLast, szLast);
-		bResults = GetOKXFloat(pszOutBuffer, fOutOpen, szOutOpen, szsodUtc8);
-	}
-	// Close any open handles.
-	if (hRequest) winHttpCloseHandle(hRequest);
-	if (hConnect) winHttpCloseHandle(hConnect);
-	if (hSession) winHttpCloseHandle(hSession);
-	return bResults;
-}
-BOOL GetSinaFloat(char* szBuffer, float* fOut, WCHAR* szOut, int n)
-{
-	char* l=szBuffer;
-	for (int i=0;i<n;i++)
-	{
-		l = xstrstr(l+1, ",");
-		if (!l)
-			break;
-	}
-	if (l)
-	{
-		l += 1;
-		char* r = xstrstr(l, ",");
-		if (r)
-		{
-			r[0] = '\0';
-			if(szOut)
-				MultiByteToWideChar(CP_UTF8, 0, l, -1, szOut, 16);
-			*fOut = xatof(l);
-			r[0] = ',';
-			return TRUE;
-		}
-	}
-	return FALSE;
-}
-BOOL GetSinaPrice(LPTSTR szName, float* fOutLast, float* fOutOpen, WCHAR* szOutLast, WCHAR* szOutOpen)
-{
-	if (hWinHttp == NULL)
-	{
-		if (!LoadWinHttp())
-			return FALSE;
-	}
-	DWORD dwSize = 0;
-	DWORD dwDownloaded = 0;
-	char pszOutBuffer[512];
-	BOOL  bResults = FALSE;
-	HINTERNET  hSession = NULL, hConnect = NULL, hRequest = NULL;
-
-	// Use WinHttpOpen to obtain a session handle.
-	hSession = winHttpOpen(L"Price", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, NULL);
-
-	//hSession = WinHttpOpen( L"WinHTTP Example/1.0",  
-	//                        WINHTTP_ACCESS_TYPE_NO_PROXY,
-	//                        WINHTTP_NO_PROXY_NAME, 
-	//                        WINHTTP_NO_PROXY_BYPASS, 0 );
-
-	// Specify an HTTP server.
-	if (hSession)
-		hConnect = winHttpConnect(hSession, L"hq.sinajs.cn",
-			INTERNET_DEFAULT_PORT, 0);
-	WCHAR szGet[256] = L"/list=";
-	lstrcat(szGet, szName);
-	// Create an HTTP request handle.
-	if (hConnect)
-		hRequest = winHttpOpenRequest(hConnect, L"GET", szGet, NULL, L"http://vip.stock.finance.sina.com.cn/", WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_REFRESH);
-
-	// Send a request.
-	if (hRequest)
-		bResults = winHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-
-
-	// End the request.
-	if (bResults)
-		bResults = winHttpReceiveResponse(hRequest, NULL);
-
-	// Keep checking for data until there is nothing left.
-	size_t i = 0;
-	ZeroMemory(pszOutBuffer, 512);
-	if (bResults)
-	{
-		do
-		{
-			dwSize = 0;
-			winHttpQueryDataAvailable(hRequest, &dwSize);
-			if (!dwSize)
-				break;
-			if (i+dwSize > 511)
-				dwSize = 511-i;
-			if (winHttpReadData(hRequest, (LPVOID)&pszOutBuffer[i], dwSize, &dwDownloaded))
-			{
-				i = strlen(pszOutBuffer);
-			}
-			if (!dwDownloaded)
-				break;
-		} while (dwSize != 0);
-		if (szName[0] == L'h')//港股
-		{
-			bResults = GetSinaFloat(pszOutBuffer, fOutOpen, szOutOpen, 3);
-			bResults = GetSinaFloat(pszOutBuffer, fOutLast, szOutLast, 6);
-		}
-		else if (szName[0] == L'g')//美股
-		{
-			bResults = GetSinaFloat(pszOutBuffer, fOutOpen, szOutOpen, 26);
-			bResults = GetSinaFloat(pszOutBuffer, fOutLast, szOutLast, 1);
-		}
-		else if (szName[0] == L'C')//股指期货
-		{
-			bResults = GetSinaFloat(pszOutBuffer, fOutOpen, szOutOpen, 14);
-			bResults = GetSinaFloat(pszOutBuffer, fOutLast, szOutLast, 3);
-		}
-		else if (szName[0] >= L'A' && szName[0] <= L'Z')
-		{
-			bResults = GetSinaFloat(pszOutBuffer, fOutOpen, szOutOpen, 10);
-			bResults = GetSinaFloat(pszOutBuffer, fOutLast, szOutLast, 8);
-		}
-		else
-		{
-			bResults = GetSinaFloat(pszOutBuffer, fOutOpen, szOutOpen, 2);
-			bResults = GetSinaFloat(pszOutBuffer, fOutLast, szOutLast, 3);
-		}
-	}
-	// Close any open handles.
-	if (hRequest) winHttpCloseHandle(hRequest);
-	if (hConnect) winHttpCloseHandle(hConnect);
-	if (hSession) winHttpCloseHandle(hSession);
-	return bResults;
-}
-
 wchar_t* lstrstr(const wchar_t* str, const wchar_t* sub)
 {
 	int i = 0;
@@ -1744,121 +1425,6 @@ wchar_t* lstrstr(const wchar_t* str, const wchar_t* sub)
 	}
 }
 
-char* xstrstr(const char* str, const char* sub)
-{
-	int i = 0;
-	int j = 0;
-	while (str[i] && sub[j])
-	{
-		if (str[i] == sub[j])//如果相等
-		{
-			++i;
-			++j;
-		}
-		else		     //如果不等
-		{
-			i = i - j + 1;
-			j = 0;
-		}
-	}
-	if (!sub[j])
-	{
-		return (char*)&str[i - strlen(sub)];
-	}
-	else
-	{
-		return (char*) 0;
-	}
-}
-float xatof(const char* s)
-{
-	float v = 0;
-	float w = 1;
-	int n = 1;
-	const char* c = s + strlen(s);
-
-	if (*s == '-') {
-		n = -1;
-		++s;
-	}
-
-	while (--c >= s) {
-		if (*c == '.') {
-			v /= w;
-			w = 1;
-		}
-		else {
-			v += (*c - '0') * w;
-			w *= 10;
-		}
-	}
-	return n * v;
-}
-float xwtof(const WCHAR* s)
-{
-	float v = 0;
-	float w = 1;
-	int n = 1;
-	const WCHAR* c = s + lstrlen(s);
-
-	if (*s == L'-') {
-		n = -1;
-		++s;
-	}
-
-	while (--c >= s) {
-		if (*c == L'.') {
-			v /= w;
-			w = 1;
-		}
-		else {
-			v += (*c - L'0') * w;
-			w *= 10;
-		}
-	}
-	return n * v;
-}
-BOOL FloatToStr(float f, WCHAR* sz)
-{
-	if(f>1000000)
-		wsprintf(sz, L"%d",(int)f);
-	else if (f > 100000)
-	{
-		int x = (int)(f * 10);
-		wsprintf(sz, L"%d.%.1d", x / 10, x % 10);
-	}
-	else if (f > 10000)
-	{
-		int x = (int)(f * 100);
-		wsprintf(sz, L"%d.%.2d", x / 100, x % 100);
-	}
-	else if (f > 1000)
-	{
-		int x = (int)(f * 1000);
-		wsprintf(sz, L"%d.%.3d", x / 1000, x % 1000);
-	}
-	else if (f > 100)
-	{
-		int x = (int)(f * 10000);
-		wsprintf(sz, L"%d.%.4d", x / 10000, x % 10000);
-	}
-	else if (f > 10)
-	{
-		int x = (int)(f * 100000);
-		wsprintf(sz, L"%d.%.5d", x / 100000, x % 100000);
-	}
-	else if (f > 1)
-	{
-		int x = (int)(f * 1000000);
-		wsprintf(sz, L"%d.%.6d", x / 1000000, x % 1000000);
-	}
-	else
-	{
-		int x = (int)(f * 10000000);
-		wsprintf(sz, L"%d.%.7d", x / 10000000, x % 10000000);
-	}
-	return TRUE;
-}
 void EmptyProcessMemory(DWORD pID)
 {
 	HANDLE hProcess;

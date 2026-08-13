@@ -20,6 +20,7 @@
 #define MSG_APPBAR_MSGID WM_USER+15//全屏幕消息
 #define  WM_IAWENTRAY WM_USER+8//通知栏消息
 #define  WM_TRAYS WM_USER+8888//打开设置消息
+#define WM_TRAYS_REFRESH_UI (WM_APP + 1)//工作线程请求主线程刷新窗口
 #define KEYDOWN(vk_code) ((GetAsyncKeyState(vk_code) & 0x8000) ? 1 : 0)
 #define KEYUP(vk_code) ((GetAsyncKeyState(vk_code) & 0x8000) ? 0 : 1)
 /*
@@ -73,14 +74,15 @@ void AddItem(LPWINDOW_INFO lpWindowInfo)
 }
 */
 /////////////////////////////////////////////自定义网卡数据结构
+#define MAX_TRAFFIC_ADAPTERS 128
 typedef struct _TRAFFIC
 {
 	ULONG64 in_bytes;
 	ULONG64 out_bytes;
 	ULONG64 in_byte;
 	ULONG64 out_byte;	
-	PWCHAR FriendlyName;
-	PCHAR AdapterName;
+	WCHAR FriendlyName[64];
+	CHAR AdapterName[128];
 	WCHAR IP4[16];
 }TRAFFIC;
 ////////////////////////////////////////////进程的内存使用数据结构
@@ -110,7 +112,6 @@ HWND hSetting;//设置窗口句柄
 HWND hTaskBar;//工具窗口句柄
 HWND hTaskTips;//提示窗口句柄
 HWND hTime;//秒窗口
-HWND hPrice;//行情窗口
 //HWND hForeground;
 HWND hTray=NULL;//系统主任务栏窗口句柄
 HWND hTaskWnd;//系统主任务列表窗口句柄
@@ -126,7 +127,6 @@ const WCHAR szAppName[] = L"TrayS";//程序名
 const WCHAR szNetCpl[] = L" cncpa.cpl";//打开网络设置
 const WCHAR szTaskmgr[] = L" oTaskmgr";//打开任务管理器
 const WCHAR szPerfmon[] = L" operfmon.exe /res";//打开资源监测器
-const WCHAR szOpenPerfDisk[] = L" olodctr /E:PerfDisk";//修复磁盘计数器
 const WCHAR szCompmgmt[] = L" ocompmgmt.msc";//计算机管理
 const WCHAR szPowerCpl[] = L" cpowercfg.cpl";//打开电源设置
 const WCHAR szTimeDateCpl[] = L" ctimedate.cpl";//打开时间日期
@@ -134,17 +134,10 @@ const WCHAR szTraySave[] = L"TrayS.dat";
 //PIP_ADAPTER_INFO ipinfo;
 typedef struct _TRAYDATA
 {
-	BOOL bExit;//是否退出
 	ULONG64 m_last_in_bytes;//总上一秒下载速度
 	ULONG64 m_last_out_bytes;//总上一秒上传速度
 	ULONG64 s_in_byte;//总下载速度
 	ULONG64 s_out_byte;//总上传速度
-	float fLastPrice1,fLastPrice2, fOpenPrice1, fOpenPrice2, fLastPrice3, fLastPrice4, fOpenPrice3, fOpenPrice4;//行情当前与昨天
-	WCHAR szLastPrice1[16];//行情数值字符串
-	WCHAR szLastPrice2[16];//行情数值字符串
-	WCHAR szLastPrice3[16];//行情数值字符串
-	WCHAR szLastPrice4[16];//行情数值字符串
-	int iPriceUpDown[4];//行情升降提醒
 	DWORD iHddTemperature;//硬盘温度
 	DWORD iTemperature1;//CPU温度
 	DWORD iTemperature2;//GPU温度
@@ -158,27 +151,35 @@ typedef struct _TRAYDATA
 	int iBytes = 0;//当前数据指针
 	*/
 }TRAYDATA;
-TRAYDATA* TrayData;
+TRAYDATA TrayDataStorage = { 0 };
+TRAYDATA* TrayData = &TrayDataStorage;
+TRAYDATA MonitorDataSnapshot = { 0 };
 PMIB_IFTABLE mi;//网速结构
 PIP_ADAPTER_ADDRESSES piaa;//网卡结构
 PMIB_IF_TABLE2 mit2;//网速结构
 TRAFFIC* traffic;//每个网卡速度
 int nTraffic = 0;//有几张网卡
+int nTrafficCapacity = 0;
+TRAFFIC TrafficSnapshot[MAX_TRAFFIC_ADAPTERS] = { 0 };
+int nTrafficSnapshot = 0;
 
 int mWidth;//工具窗口宽度
 int mHeight;//工具窗口竖排高度
 int wSpace;//模块间隔
 int iDPI = 96;//当前DPI
 BOOL VTray = FALSE;//竖的任务栏
-BOOL bRealClose = FALSE;
 BOOL bSetting = FALSE;
 /////////////////////////////////////////////////获取数据线程
 DWORD WINAPI MainThreadProc(PVOID pParam);
 DWORD WINAPI GetDataThreadProc(PVOID pParam);
 //HANDLE hMainThread = NULL;
 HANDLE hGetDataThread = NULL;
-HANDLE hPriceThread = NULL;
-HANDLE hMap = NULL;
+HANDLE hStopEvent = NULL;
+CRITICAL_SECTION MonitorBackendLock;
+BOOL bMonitorBackendLockInitialized = FALSE;
+CRITICAL_SECTION MonitorDataLock;
+BOOL bMonitorDataLockInitialized = FALSE;
+UINT uTaskbarCreated = 0;
 BOOL bShadow = FALSE;//显示阴影文字
 COLORREF bColor = 0x181818;//阴影颜色
 DWORD bThemeMode = 0;//颜色模式
@@ -240,23 +241,10 @@ typedef struct _TRAYSAVE//默认参数
 	WCHAR szDiskWriteSec[8];//硬盘写入显示的文字
 	WCHAR szDiskName[8];//硬盘名称
 	WCHAR szDisk;//盘符
-	BOOL bMonitorPrice;//显示行情
-	float HighRemind[12];//超过价格提醒
-	float LowRemind[12];//低过价格提醒
-	BOOL bCheckHighRemind[12];
-	BOOL bCheckLowRemind[12];
-	WCHAR szPriceName1[64];
-	WCHAR szPriceName2[64];
-	WCHAR szPriceName3[64];
-	WCHAR szPriceName4[64];
-	int iPriceInterface[4];
-	WCHAR szOKXWeb[32];
-	BOOL bTwoFour;
-	COLORREF cPriceColor[4];//行情颜色
 	BOOL bTrayStyle;//任务栏风格开关
 }TRAYSAVE;
 TRAYSAVE TraySave = {
-	116,
+	117,
 	{ ACCENT_ENABLE_TRANSPARENTGRADIENT,ACCENT_ENABLE_BLURBEHIND } ,
 	{ 0x00111111,0x66000000 },{ 255,255 } ,
 	{ 10 * 1024 * 1024,64 * 1024 * 1024,66,96,81,96,61,88,98 * 1048576,88,0,0 } ,
@@ -276,7 +264,7 @@ TRAYSAVE TraySave = {
 	{ RGB(0,0,1),RGB(128,128,128),RGB(255,255,255),RGB(255,0,0),RGB(0,168,0),RGB(255,128,0),RGB(255,0,0),RGB(0,0,0) },
 	{ 666,666 },
 	{0},
-	11,
+	250,
 	TRUE,
 	{-14,0,0,0,FW_BOLD,0,0,0,0,0,0,0,0,L"微软雅黑"} ,
 	-14,
@@ -305,27 +293,14 @@ TRAYSAVE TraySave = {
 	L"写入:",
 	L"硬盘:",
 	0,
-	FALSE,
-	{0},
-	{0},
-	{0},
-	{0},
-	L"sh000001",
-	L"sz399001",
-	L"BTC-USDT-SWAP",
-	L"ETH-USDT-SWAP",
-	{0,0,1,1},
-	L"www.okx.com",
-	FALSE,
-	{RGB(0, 168, 0), RGB(255, 0, 0),RGB(0,255,128),RGB(255,128,0)},
 	TRUE
 };
+TRAYSAVE MonitorSettings = { 0 };//仅由 UI 线程发布，工作线程读取的配置快照
 int wTraffic;//流量宽度
 int wTemperature;//温度宽度
 int wUsage;//利用率宽度
 int wDisk;//硬盘流量宽度
 int wTime;//时间宽度
-int wPrice;//行情宽度
 int wHeight;//监控字符高度
 POINT pTime;//秒位置
 HFONT hFont;//监控窗口字体
@@ -338,13 +313,19 @@ int iProject = -1;
 int iWindowMode=FALSE;
 //BOOL bAccentNormal = FALSE;
 MEMORYSTATUSEX MemoryStatusEx;/////////////////虚拟内存/内存大小
+MEMORYSTATUSEX MemoryStatusSnapshot;
+DWORD CpuUsageSnapshot = 0;
 BOOL bTaskBarMoveing = FALSE;///////////////////窗口是否正在移动中
 PROCESSMEMORYUSAGE pmu[6];
-PROCESSMEMORYUSAGE *ppmu[6];
 PROCESSCPUUSAGE pcu[6];
-PROCESSCPUUSAGE *ppcu[6];
+PROCESSMEMORYUSAGE pmuWork[6];
+PROCESSMEMORYUSAGE *ppmuWork[6];
+PROCESSCPUUSAGE pcuWork[6];
+PROCESSCPUUSAGE *ppcuWork[6];
 int nProcess;
 PROCESSTIME * pProcessTime;
+int nProcessTimeCapacity = 0;
+volatile LONG bTaskTipsActive = FALSE;
 
 //BOOL bTaskOther = FALSE;
 
@@ -495,12 +476,13 @@ typedef NV_GPU_THERMAL_SETTINGS_V2  NV_GPU_THERMAL_SETTINGS;
 typedef UINT32 NvAPI_Status;
 typedef void* (*NvAPI_QueryInterface_t)(UINT32 offset);
 typedef NvAPI_Status(__cdecl *NvAPI_Initialize_t)(void);
-typedef NvAPI_Status(*NvAPI_EnumPhysicalGPUs_t)(NvPhysicalGpuHandle *pGpuHandles, int *pGpuCount);
+typedef NvAPI_Status(*NvAPI_EnumPhysicalGPUs_t)(NvPhysicalGpuHandle *pGpuHandles, NvU32 *pGpuCount);
 typedef NvAPI_Status(__cdecl *NvAPI_GPU_GetThermalSettings_t)(const NvPhysicalGpuHandle gpuHandle, int sensorIndex, NV_GPU_THERMAL_SETTINGS *pnvGPUThermalSettings);
 NvAPI_QueryInterface_t NvAPI_QueryInterface;
 NvAPI_GPU_GetThermalSettings_t NvAPI_GPU_GetThermalSettings;
 HMODULE hNVDLL = NULL;
-NvPhysicalGpuHandle hPhysicalGpu[4];
+NvPhysicalGpuHandle hPhysicalGpu[NVAPI_MAX_PHYSICAL_GPUS];
+int nPhysicalGpu = 0;
 /////////////////////////////////////////////////////CPU频率
 typedef struct _PROCESSOR_POWER_INFORMATION {
 	ULONG Number;
@@ -521,8 +503,8 @@ INT_PTR CALLBACK    SettingProc(HWND, UINT, WPARAM, LPARAM);//设置窗口过程
 INT_PTR CALLBACK    TaskBarProc(HWND, UINT, WPARAM, LPARAM);//任务栏监控窗口过程
 INT_PTR CALLBACK    TaskTipsProc(HWND, UINT, WPARAM, LPARAM);//提示窗口过程
 INT_PTR CALLBACK    TimeProc(HWND, UINT, WPARAM, LPARAM);//秒窗口过程
-INT_PTR CALLBACK    PriceProc(HWND, UINT, WPARAM, LPARAM);//行情窗口过程
 void SetTaskBarPos(HWND, HWND, HWND, HWND, BOOL);//设置任务栏图标位置
+void CloseTaskBar();//关闭任务栏监控窗口
 int DrawShadowText(HDC hDC, LPCTSTR lpString, int nCount, LPRECT lpRect, UINT uFormat);//绘制阴影文字
 void FreeTemperatureDLL();//
 void LoadTemperatureDLL();//加载DLL
@@ -531,4 +513,3 @@ int GetProcessMemUsage();//获取内存使用大小
 void GetProcessCpuUsage();//获取进程CPU使用率
 void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit,int iUnit=0);//流量转字符串
 void ShowSelectMenu(BOOL bNet);//显示网卡/硬盘菜单
-void DrawPrice(HDC mdc, LPRECT crc, float fLast, float fOpen, WCHAR* szLast, int iPriceUpDown);//绘制行情
