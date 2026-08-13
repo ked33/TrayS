@@ -17,6 +17,7 @@
 mono_crash.*
 
 # Build results
+/build/
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
@@ -58,10 +59,12 @@ dlldata.c
 # Benchmark Results
 BenchmarkDotNet.Artifacts/
 
+# Packaged CI artifacts
+/artifacts/
+
 # .NET Core
 project.lock.json
 project.fragment.lock.json
-artifacts/
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
