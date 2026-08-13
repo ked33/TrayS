@@ -3306,6 +3306,23 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 	return TRUE;
 }
 
+static const UINT_PTR TASK_TIPS_PAUSE_TIMER_ID = 1;
+static const UINT TASK_TIPS_PAUSE_POLL_INTERVAL_MS = 100;
+
+static BOOL ShouldPauseTaskTips(HWND window)
+{
+	// 提示窗口不激活，无法可靠接收键盘消息；在 UI 线程轻量轮询 Ctrl，
+	// 只冻结显示快照，后台采集仍继续，避免破坏 CPU/网络采样基线。
+	if (!IsWindowVisible(window) ||
+		(!KEYDOWN(VK_CONTROL) && !KEYDOWN(VK_LCONTROL) && !KEYDOWN(VK_RCONTROL)))
+		return FALSE;
+	POINT cursor;
+	if (!GetCursorPos(&cursor))
+		return FALSE;
+	HWND hoveredWindow = WindowFromPoint(cursor);
+	return hoveredWindow == window || (hoveredWindow && IsChild(window, hoveredWindow));
+}
+
 INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)//提示信息窗口过程
 {
 	static TRAFFIC trafficData[MAX_TRAFFIC_ADAPTERS] = { 0 };
@@ -3313,15 +3330,37 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	static PROCESSCPUUSAGE cpuProcesses[MAX_TIPS_PROCESS_ROWS] = { 0 };
 	static MEMORYSTATUSEX memoryStatus = { 0 };
 	static TRAYSAVE displaySettings = { 0 };
+	static int trafficCount = 0;
 	static int scrollOffset = 0;
 	static int wheelRemainder = 0;
-	int trafficCount = ReadTaskTipsSnapshot(
-		trafficData,
-		ARRAYSIZE(trafficData),
-		memoryProcesses,
-		cpuProcesses,
-		&memoryStatus,
-		&displaySettings);
+	static BOOL displayPaused = FALSE;
+	if (message == WM_TIMER && wParam == TASK_TIPS_PAUSE_TIMER_ID)
+	{
+		BOOL pauseRequested = ShouldPauseTaskTips(hDlg);
+		if (pauseRequested != displayPaused)
+		{
+			trafficCount = ReadTaskTipsSnapshot(
+				trafficData,
+				ARRAYSIZE(trafficData),
+				memoryProcesses,
+				cpuProcesses,
+				&memoryStatus,
+				&displaySettings);
+			displayPaused = pauseRequested;
+			InvalidateRect(hDlg, NULL, TRUE);
+		}
+		return (INT_PTR)TRUE;
+	}
+	if (!displayPaused || message == WM_INITDIALOG)
+	{
+		trafficCount = ReadTaskTipsSnapshot(
+			trafficData,
+			ARRAYSIZE(trafficData),
+			memoryProcesses,
+			cpuProcesses,
+			&memoryStatus,
+			&displaySettings);
+	}
 	int trafficRows = displaySettings.bTipsTraffic ? trafficCount : 0;
 	if (trafficRows > (int)displaySettings.TipsTrafficRows)
 		trafficRows = (int)displaySettings.TipsTrafficRows;
@@ -3350,8 +3389,10 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	switch (message)
 	{
 	case WM_INITDIALOG:
+		displayPaused = FALSE;
 		scrollOffset = 0;
 		wheelRemainder = 0;
+		SetTimer(hDlg, TASK_TIPS_PAUSE_TIMER_ID, TASK_TIPS_PAUSE_POLL_INTERVAL_MS, NULL);
 		SetWindowLongPtr(hDlg, GWL_STYLE, GetWindowLongPtr(hDlg, GWL_STYLE) | WS_VSCROLL);
 		SetWindowPos(hDlg, NULL, 0, 0, 0, 0,
 			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -3360,9 +3401,12 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		InterlockedExchange(&bTaskTipsActive, TRUE);
 		return (INT_PTR)TRUE;
 	case WM_DESTROY:
+		KillTimer(hDlg, TASK_TIPS_PAUSE_TIMER_ID);
 		InterlockedExchange(&bTaskTipsActive, FALSE);
 		hTaskTips = NULL;
 		inTipsProcessX = FALSE;
+		displayPaused = FALSE;
+		trafficCount = 0;
 		scrollOffset = 0;
 		wheelRemainder = 0;
 		return (INT_PTR)TRUE;
@@ -4973,6 +5017,15 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 	{
 	case WM_INITDIALOG:
 		return (INT_PTR)TRUE;
+	case WM_CLOSE:
+		KillTimer(hDlg, 3);
+		WriteReg();
+		DestroyWindow(hDlg);
+		return (INT_PTR)TRUE;
+	case WM_DESTROY:
+		if (hSetting == hDlg)
+			hSetting = NULL;
+		return (INT_PTR)TRUE;
 	case WM_NOTIFY:
 		switch (((LPNMHDR)lParam)->code)
 		{
@@ -5301,24 +5354,23 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		else if (LOWORD(wParam) == IDC_RESTORE_DEFAULT)
 		{
+			KillTimer(hDlg, 3);
 			DeleteFile(szTraySave);
 			//			RegDeleteKey(HKEY_CURRENT_USER, szSubKey);
-			SendMessage(hDlg, WM_COMMAND, IDCANCEL, 0);
+			SendMessage(hMain, WM_CLOSE, NULL, NULL);
+			return (INT_PTR)TRUE;
 		}
 		else if (LOWORD(wParam) == IDCANCEL)
 		{
-			/*
-						SendMessage(hMain, WM_TIMER, 11, 1000);
-						DestroyWindow(hDlg);
-						return (INT_PTR)TRUE;
-			*/
-			//			SendMessage(hReBarWnd, WM_SETREDRAW, TRUE, 0);
-			SendMessage(hMain, WM_CLOSE, NULL, NULL);
+			SendMessage(hDlg, WM_CLOSE, NULL, NULL);
 			return (INT_PTR)TRUE;
 		}
 		else if (LOWORD(wParam) == IDC_CLOSE)
 		{
+			KillTimer(hDlg, 3);
+			WriteReg();
 			SendMessage(hMain, WM_CLOSE, NULL, NULL);
+			return (INT_PTR)TRUE;
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_SELECT_NET)
 		{
