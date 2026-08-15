@@ -42,6 +42,9 @@
 #define PM_ACTION_PROMPT 0
 #define PM_ACTION_AUTO_TERMINATE 1
 
+#define PM_TASK_ALERT_TERMINATE 1600
+#define PM_TASK_ALERT_IGNORE 1601
+
 #define PM_UI_ALERT 1
 #define PM_UI_CLEAR 2
 #define PM_UI_RESULT 3
@@ -148,6 +151,7 @@ typedef PDH_STATUS(WINAPI* PM_PDH_GET_FORMATTED_COUNTER_ARRAY)(PDH_HCOUNTER, DWO
 typedef PDH_STATUS(WINAPI* PM_PDH_CLOSE_QUERY)(PDH_HQUERY);
 typedef BOOL(WINAPI* PM_GET_PROCESS_MEMORY_INFO)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
 typedef BOOL(WINAPI* PM_IS_PROCESS_CRITICAL)(HANDLE, PBOOL);
+typedef HRESULT(WINAPI* PM_TASK_DIALOG_INDIRECT)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
 
 static HWND g_mainWindow;
 static HWND g_rulesWindow;
@@ -185,6 +189,7 @@ static DWORD g_alertTail;
 static DWORD g_alertCount;
 static PM_INCIDENT g_currentAlert;
 static BOOL g_hasCurrentAlert;
+static BOOL g_taskDialogRunning;
 static PM_UI_EVENT g_dispatchEvent;
 static WCHAR g_resultMessage[768];
 static PM_RULE_RUNTIME g_runtime[PM_MAX_RULES];
@@ -221,8 +226,10 @@ static INT_PTR CALLBACK RuleEditDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK ProcessPickerDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK AlertDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK ResultDialogProc(HWND, UINT, WPARAM, LPARAM);
+static HRESULT CALLBACK AlertTaskDialogCallback(HWND, UINT, WPARAM, LPARAM, LONG_PTR);
 static void QueueUiEvent(DWORD, const PM_INCIDENT*, const WCHAR*);
 static void ShowNextAlert();
+static void FinishCurrentAlert(BOOL);
 
 static ULONGLONG FileTimeToUInt64(const FILETIME* value)
 {
@@ -2647,14 +2654,120 @@ static void ClearAllAlerts()
 	}
 }
 
+static HRESULT CALLBACK AlertTaskDialogCallback(HWND dialog, UINT notification, WPARAM wParam, LPARAM lParam, LONG_PTR referenceData)
+{
+	UNREFERENCED_PARAMETER(wParam);
+	UNREFERENCED_PARAMETER(lParam);
+	UNREFERENCED_PARAMETER(referenceData);
+	if (notification == TDN_CREATED)
+	{
+		g_alertWindow = dialog;
+		SetWindowPos(dialog, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		if (g_hasCurrentAlert && g_currentAlert.pid == 1234 && g_currentAlert.createTime == 0)
+			SendMessageW(dialog, TDM_ENABLE_BUTTON, PM_TASK_ALERT_TERMINATE, FALSE);
+	}
+	else if (notification == TDN_DESTROYED && g_alertWindow == dialog)
+		g_alertWindow = NULL;
+	return S_OK;
+}
+
+static BOOL ShowSystemAlert(int* selectedButton)
+{
+	if (!selectedButton || !g_hasCurrentAlert)
+		return FALSE;
+	HMODULE commonControls = LoadLibraryW(L"comctl32.dll");
+	if (!commonControls)
+		return FALSE;
+	PM_TASK_DIALOG_INDIRECT taskDialog = (PM_TASK_DIALOG_INDIRECT)GetProcAddress(commonControls, "TaskDialogIndirect");
+	if (!taskDialog)
+	{
+		FreeLibrary(commonControls);
+		return FALSE;
+	}
+
+	WCHAR metrics[384];
+	FormatIncidentMetrics(&g_currentAlert, metrics, ARRAYSIZE(metrics));
+	const WCHAR* alertPath = g_currentAlert.path ? g_currentAlert.path : L"";
+	WCHAR pidText[32];
+	WCHAR holdText[32];
+	wsprintfW(pidText, L"%u", g_currentAlert.pid);
+	wsprintfW(holdText, L"%u", g_currentAlert.holdSeconds);
+	WCHAR content[768] = L"";
+	AppendText(content, ARRAYSIZE(content), L"程序：");
+	AppendText(content, ARRAYSIZE(content), BaseName(alertPath));
+	AppendText(content, ARRAYSIZE(content), L"\r\nPID：");
+	AppendText(content, ARRAYSIZE(content), pidText);
+	AppendText(content, ARRAYSIZE(content), L"\r\n连续超限：");
+	AppendText(content, ARRAYSIZE(content), holdText);
+	AppendText(content, ARRAYSIZE(content), L" 秒\r\n");
+	AppendText(content, ARRAYSIZE(content), metrics);
+
+	SIZE_T detailsCount = (SIZE_T)lstrlenW(alertPath) + lstrlenW(metrics) + 128;
+	WCHAR* details = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, detailsCount * sizeof(WCHAR));
+	if (details)
+	{
+		AppendText(details, (DWORD)detailsCount, L"完整路径：");
+		AppendText(details, (DWORD)detailsCount, alertPath);
+		AppendText(details, (DWORD)detailsCount, L"\r\n\r\n");
+		AppendText(details, (DWORD)detailsCount, metrics);
+	}
+
+	TASKDIALOG_BUTTON buttons[] =
+	{
+		{ PM_TASK_ALERT_TERMINATE, L"终止进程\n先请求正常关闭，5 秒后仍在运行才强制终止" },
+		{ PM_TASK_ALERT_IGNORE, L"暂不终止\n忽略本次告警，资源恢复后才会重新提示" }
+	};
+	TASKDIALOGCONFIG config;
+	ZeroMemory(&config, sizeof(config));
+	config.cbSize = sizeof(config);
+	config.hwndParent = g_mainWindow;
+	config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS | TDF_SIZE_TO_CONTENT;
+	config.pszWindowTitle = L"TrayS 进程资源告警";
+	config.pszMainIcon = TD_WARNING_ICON;
+	config.pszMainInstruction = (g_currentAlert.pid == 1234 && g_currentAlert.createTime == 0) ?
+		L"测试提示（不会执行真实终止操作）" : L"检测到进程持续超出资源阈值";
+	config.pszContent = content;
+	config.cButtons = ARRAYSIZE(buttons);
+	config.pButtons = buttons;
+	config.nDefaultButton = PM_TASK_ALERT_IGNORE;
+	config.pszExpandedInformation = details;
+	config.pszExpandedControlText = L"查看详细信息";
+	config.pszCollapsedControlText = L"隐藏详细信息";
+	config.pszFooter = L"关闭窗口或按 Esc 等同于“暂不终止”。";
+	config.pfCallback = AlertTaskDialogCallback;
+
+	int button = 0;
+	HRESULT result = taskDialog(&config, &button, NULL, NULL);
+	if (details)
+		HeapFree(GetProcessHeap(), 0, details);
+	FreeLibrary(commonControls);
+	if (FAILED(result))
+		return FALSE;
+	*selectedButton = button;
+	return TRUE;
+}
+
 static void ShowNextAlert()
 {
-	if (g_alertWindow || g_hasCurrentAlert || g_alertCount == 0)
+	if (g_taskDialogRunning || g_alertWindow || g_hasCurrentAlert || g_alertCount == 0)
 		return;
 	MoveIncident(&g_currentAlert, &g_alerts[g_alertHead]);
 	g_alertHead = (g_alertHead + 1) % PM_MAX_ALERTS;
 	--g_alertCount;
 	g_hasCurrentAlert = TRUE;
+	int selectedButton = 0;
+	g_taskDialogRunning = TRUE;
+	BOOL shownBySystem = ShowSystemAlert(&selectedButton);
+	if (shownBySystem)
+	{
+		if (g_hasCurrentAlert)
+			FinishCurrentAlert(selectedButton == PM_TASK_ALERT_TERMINATE);
+		g_taskDialogRunning = FALSE;
+		ShowNextAlert();
+		return;
+	}
+	g_taskDialogRunning = FALSE;
+	// Compatibility fallback for systems where the native task dialog API cannot be loaded.
 	g_alertWindow = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_PROCESS_ALERT), NULL, AlertDialogProc, 0);
 	if (!g_alertWindow)
 	{
@@ -2855,6 +2968,7 @@ BOOL ProcessMonitorInitialize(HWND mainWindow, HINSTANCE instance, HICON appIcon
 	g_instance = instance;
 	g_appIcon = appIcon;
 	g_trayIconId = trayIconId;
+	g_taskDialogRunning = FALSE;
 	InitializeCriticalSection(&g_configLock);
 	InitializeCriticalSection(&g_uiLock);
 	InitializeCriticalSection(&g_actionLock);
@@ -3007,6 +3121,7 @@ void ProcessMonitorShutdown()
 	g_instance = NULL;
 	g_appIcon = NULL;
 	g_trayIconId = 0;
+	g_taskDialogRunning = FALSE;
 	g_runtimeCount = 0;
 	g_sampleCycle = 0;
 	ZeroMemory(g_states, sizeof(g_states));
