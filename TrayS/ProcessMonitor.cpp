@@ -44,6 +44,7 @@
 
 #define PM_TASK_ALERT_TERMINATE 1600
 #define PM_TASK_ALERT_IGNORE 1601
+#define PM_ALERT_TIMEOUT_MS 15000
 
 #define PM_UI_ALERT 1
 #define PM_UI_CLEAR 2
@@ -190,6 +191,11 @@ static DWORD g_alertCount;
 static PM_INCIDENT g_currentAlert;
 static BOOL g_hasCurrentAlert;
 static BOOL g_taskDialogRunning;
+static BOOL g_alertNotificationActive;
+static BOOL g_alertTemporaryTrayIcon;
+static BOOL g_trayIconAvailable;
+static UINT g_alertNotificationIconId;
+static UINT_PTR g_alertTimerId;
 static PM_UI_EVENT g_dispatchEvent;
 static WCHAR g_resultMessage[768];
 static PM_RULE_RUNTIME g_runtime[PM_MAX_RULES];
@@ -230,6 +236,8 @@ static HRESULT CALLBACK AlertTaskDialogCallback(HWND, UINT, WPARAM, LPARAM, LONG
 static void QueueUiEvent(DWORD, const PM_INCIDENT*, const WCHAR*);
 static void ShowNextAlert();
 static void FinishCurrentAlert(BOOL);
+static void DismissAlertNotification();
+static VOID CALLBACK AlertNotificationTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
 static ULONGLONG FileTimeToUInt64(const FILETIME* value)
 {
@@ -2623,6 +2631,7 @@ static void RemoveAlertForIncident(const PM_INCIDENT* incident)
 	if (g_hasCurrentAlert && g_currentAlert.pid == incident->pid && g_currentAlert.createTime == incident->createTime &&
 		GuidEqual(&g_currentAlert.ruleId, &incident->ruleId))
 	{
+		DismissAlertNotification();
 		g_hasCurrentAlert = FALSE;
 		FreeIncident(&g_currentAlert);
 		if (g_alertWindow)
@@ -2637,6 +2646,7 @@ static void RemoveAlertForIncident(const PM_INCIDENT* incident)
 
 static void ClearAllAlerts()
 {
+	DismissAlertNotification();
 	while (g_alertCount > 0)
 	{
 		FreeIncident(&g_alerts[g_alertHead]);
@@ -2652,6 +2662,114 @@ static void ClearAllAlerts()
 		g_alertWindow = NULL;
 		DestroyWindow(window);
 	}
+}
+
+static BOOL ShowAlertNotification()
+{
+	if (!g_mainWindow || !g_hasCurrentAlert)
+		return FALSE;
+
+	NOTIFYICONDATAW data;
+	ZeroMemory(&data, sizeof(data));
+	data.cbSize = sizeof(data);
+	data.hWnd = g_mainWindow;
+	data.uID = g_trayIconId;
+	data.uFlags = NIF_INFO;
+	CopyText(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle), L"TrayS 进程资源告警");
+	WCHAR metrics[384];
+	FormatIncidentMetrics(&g_currentAlert, metrics, ARRAYSIZE(metrics));
+	WCHAR body[256] = L"";
+	AppendText(body, ARRAYSIZE(body), L"程序：");
+	AppendText(body, ARRAYSIZE(body), BaseName(g_currentAlert.path));
+	WCHAR pidText[32];
+	wsprintfW(pidText, L"（PID %u）\r\n", g_currentAlert.pid);
+	AppendText(body, ARRAYSIZE(body), pidText);
+	AppendText(body, ARRAYSIZE(body), metrics);
+	AppendText(body, ARRAYSIZE(body), L"\r\n单击通知选择处理方式；关闭则暂不终止。");
+	CopyText(data.szInfo, ARRAYSIZE(data.szInfo), body);
+	data.dwInfoFlags = NIIF_WARNING;
+	data.uTimeout = PM_ALERT_TIMEOUT_MS;
+
+	if (!g_trayIconAvailable)
+	{
+		// A disabled tray icon cannot receive balloon callbacks, so create a temporary one
+		// only for the lifetime of this notification.
+		data.uID = g_trayIconId + 1;
+		data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+		data.hIcon = g_appIcon;
+		data.uCallbackMessage = WM_PROCESS_MONITOR_NOTIFICATION;
+		CopyText(data.szTip, ARRAYSIZE(data.szTip), L"TrayS 进程监控");
+		if (!Shell_NotifyIconW(NIM_ADD, &data))
+			return FALSE;
+		g_alertTemporaryTrayIcon = TRUE;
+		g_alertNotificationIconId = data.uID;
+		data.uFlags = NIF_INFO;
+	}
+	else
+		g_alertNotificationIconId = data.uID;
+
+	if (!Shell_NotifyIconW(NIM_MODIFY, &data))
+	{
+		if (g_alertTemporaryTrayIcon)
+		{
+			NOTIFYICONDATAW removeData;
+			ZeroMemory(&removeData, sizeof(removeData));
+			removeData.cbSize = sizeof(removeData);
+			removeData.hWnd = g_mainWindow;
+			removeData.uID = g_alertNotificationIconId;
+			Shell_NotifyIconW(NIM_DELETE, &removeData);
+		}
+		g_alertTemporaryTrayIcon = FALSE;
+		g_alertNotificationIconId = 0;
+		return FALSE;
+	}
+
+	g_alertNotificationActive = TRUE;
+	g_alertTimerId = SetTimer(NULL, 0, PM_ALERT_TIMEOUT_MS, AlertNotificationTimerProc);
+	return TRUE;
+}
+
+static void DismissAlertNotification()
+{
+	if (g_alertTimerId)
+	{
+		KillTimer(NULL, g_alertTimerId);
+		g_alertTimerId = 0;
+	}
+	BOOL wasActive = g_alertNotificationActive;
+	BOOL temporary = g_alertTemporaryTrayIcon;
+	UINT iconId = g_alertNotificationIconId;
+	g_alertNotificationActive = FALSE;
+	g_alertTemporaryTrayIcon = FALSE;
+	g_alertNotificationIconId = 0;
+	if (!g_mainWindow || !iconId)
+		return;
+
+	NOTIFYICONDATAW data;
+	ZeroMemory(&data, sizeof(data));
+	data.cbSize = sizeof(data);
+	data.hWnd = g_mainWindow;
+	data.uID = iconId;
+	if (temporary)
+	{
+		Shell_NotifyIconW(NIM_DELETE, &data);
+	}
+	else if (wasActive)
+	{
+		data.uFlags = NIF_INFO;
+		data.szInfo[0] = 0;
+		Shell_NotifyIconW(NIM_MODIFY, &data);
+	}
+}
+
+static VOID CALLBACK AlertNotificationTimerProc(HWND window, UINT message, UINT_PTR timerId, DWORD time)
+{
+	UNREFERENCED_PARAMETER(window);
+	UNREFERENCED_PARAMETER(message);
+	UNREFERENCED_PARAMETER(timerId);
+	UNREFERENCED_PARAMETER(time);
+	if (g_alertNotificationActive)
+		FinishCurrentAlert(FALSE);
 }
 
 static HRESULT CALLBACK AlertTaskDialogCallback(HWND dialog, UINT notification, WPARAM wParam, LPARAM lParam, LONG_PTR referenceData)
@@ -2749,12 +2867,17 @@ static BOOL ShowSystemAlert(int* selectedButton)
 
 static void ShowNextAlert()
 {
-	if (g_taskDialogRunning || g_alertWindow || g_hasCurrentAlert || g_alertCount == 0)
+	if (g_taskDialogRunning || g_alertNotificationActive || g_alertWindow || g_hasCurrentAlert || g_alertCount == 0)
 		return;
 	MoveIncident(&g_currentAlert, &g_alerts[g_alertHead]);
 	g_alertHead = (g_alertHead + 1) % PM_MAX_ALERTS;
 	--g_alertCount;
 	g_hasCurrentAlert = TRUE;
+	if (ShowAlertNotification())
+		return;
+
+	// If the Windows notification service is unavailable, retain the native task dialog
+	// so a resource alert is never silently discarded.
 	int selectedButton = 0;
 	g_taskDialogRunning = TRUE;
 	BOOL shownBySystem = ShowSystemAlert(&selectedButton);
@@ -2802,6 +2925,7 @@ static void FinishCurrentAlert(BOOL terminate)
 {
 	if (!g_hasCurrentAlert)
 		return;
+	DismissAlertNotification();
 	PM_INCIDENT incident;
 	ZeroMemory(&incident, sizeof(incident));
 	MoveIncident(&incident, &g_currentAlert);
@@ -2926,7 +3050,7 @@ static INT_PTR CALLBACK ResultDialogProc(HWND dialog, UINT message, WPARAM wPara
 
 static void ShowResultNotification(const WCHAR* message, BOOL trayIconAvailable)
 {
-	if (trayIconAvailable && g_mainWindow)
+	if (trayIconAvailable && g_mainWindow && !g_alertNotificationActive)
 	{
 		NOTIFYICONDATAW data;
 		ZeroMemory(&data, sizeof(data));
@@ -2969,6 +3093,11 @@ BOOL ProcessMonitorInitialize(HWND mainWindow, HINSTANCE instance, HICON appIcon
 	g_appIcon = appIcon;
 	g_trayIconId = trayIconId;
 	g_taskDialogRunning = FALSE;
+	g_alertNotificationActive = FALSE;
+	g_alertTemporaryTrayIcon = FALSE;
+	g_trayIconAvailable = FALSE;
+	g_alertNotificationIconId = 0;
+	g_alertTimerId = 0;
 	InitializeCriticalSection(&g_configLock);
 	InitializeCriticalSection(&g_uiLock);
 	InitializeCriticalSection(&g_actionLock);
@@ -3122,6 +3251,11 @@ void ProcessMonitorShutdown()
 	g_appIcon = NULL;
 	g_trayIconId = 0;
 	g_taskDialogRunning = FALSE;
+	g_alertNotificationActive = FALSE;
+	g_alertTemporaryTrayIcon = FALSE;
+	g_trayIconAvailable = FALSE;
+	g_alertNotificationIconId = 0;
+	g_alertTimerId = 0;
 	g_runtimeCount = 0;
 	g_sampleCycle = 0;
 	ZeroMemory(g_states, sizeof(g_states));
@@ -3155,6 +3289,7 @@ void ProcessMonitorOpenRulesWindow(HWND owner)
 
 void ProcessMonitorDispatchUi(BOOL trayIconAvailable)
 {
+	g_trayIconAvailable = trayIconAvailable;
 	while (PopUiEvent(&g_dispatchEvent))
 	{
 		if (g_dispatchEvent.type == PM_UI_ALERT)
@@ -3208,6 +3343,47 @@ void ProcessMonitorDispatchUi(BOOL trayIconAvailable)
 		}
 		FreeIncident(&g_dispatchEvent.incident);
 	}
+}
+
+BOOL ProcessMonitorHandleNotification(WPARAM wParam, LPARAM lParam)
+{
+	UNREFERENCED_PARAMETER(wParam);
+	if (!g_alertNotificationActive)
+		return FALSE;
+	UINT notification = LOWORD(lParam);
+	if (notification == NIN_BALLOONUSERCLICK)
+	{
+		DismissAlertNotification();
+		if (!g_hasCurrentAlert)
+			return TRUE;
+		int selectedButton = 0;
+		g_taskDialogRunning = TRUE;
+		BOOL shownBySystem = ShowSystemAlert(&selectedButton);
+		if (shownBySystem)
+		{
+			if (g_hasCurrentAlert)
+				FinishCurrentAlert(selectedButton == PM_TASK_ALERT_TERMINATE);
+			g_taskDialogRunning = FALSE;
+			ShowNextAlert();
+			return TRUE;
+		}
+		g_taskDialogRunning = FALSE;
+		g_alertWindow = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_PROCESS_ALERT), NULL, AlertDialogProc, 0);
+		if (g_alertWindow)
+		{
+			ShowWindow(g_alertWindow, SW_SHOWNORMAL);
+			SetForegroundWindow(g_alertWindow);
+		}
+		else
+			FinishCurrentAlert(FALSE);
+		return TRUE;
+	}
+	if (notification == NIN_BALLOONTIMEOUT || notification == NIN_BALLOONHIDE)
+	{
+		FinishCurrentAlert(FALSE);
+		return TRUE;
+	}
+	return notification == NIN_BALLOONSHOW;
 }
 
 BOOL ProcessMonitorIsDialogMessage(MSG* message)

@@ -4805,6 +4805,11 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 		ProcessMonitorDispatchUi(TraySave.bTrayIcon);
 		return TRUE;
 	}
+	if (message == WM_PROCESS_MONITOR_NOTIFICATION)
+	{
+		ProcessMonitorHandleNotification(wParam, lParam);
+		return TRUE;
+	}
 	switch (message)
 	{
 	case MSG_APPBAR_MSGID:
@@ -5000,6 +5005,8 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 	break;
 	case WM_IAWENTRAY://////////////////////////////////////////////////////////////////////////////////通知栏左右键处理
 	{
+		if (ProcessMonitorHandleNotification(wParam, lParam))
+			return TRUE;
 		if (LOWORD(lParam) == WM_LBUTTONDOWN || LOWORD(lParam) == WM_RBUTTONDOWN)
 		{
 			OpenSetting();
