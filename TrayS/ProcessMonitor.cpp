@@ -45,6 +45,10 @@
 #define PM_TASK_ALERT_TERMINATE 1600
 #define PM_TASK_ALERT_IGNORE 1601
 #define PM_ALERT_TIMEOUT_MS 15000
+#define PM_RESULT_NOTIFICATION_TIMEOUT_MS 8000
+#define PM_NOTIFICATION_OWNER_NONE 0
+#define PM_NOTIFICATION_OWNER_ALERT 1
+#define PM_NOTIFICATION_OWNER_RESULT 2
 
 #define PM_UI_ALERT 1
 #define PM_UI_CLEAR 2
@@ -157,7 +161,6 @@ typedef HRESULT(WINAPI* PM_TASK_DIALOG_INDIRECT)(const TASKDIALOGCONFIG*, int*, 
 static HWND g_mainWindow;
 static HWND g_rulesWindow;
 static HWND g_alertWindow;
-static HWND g_resultWindow;
 static HINSTANCE g_instance;
 static HICON g_appIcon;
 static UINT g_trayIconId;
@@ -192,10 +195,12 @@ static PM_INCIDENT g_currentAlert;
 static BOOL g_hasCurrentAlert;
 static BOOL g_taskDialogRunning;
 static BOOL g_alertNotificationActive;
-static BOOL g_alertTemporaryTrayIcon;
-static BOOL g_trayIconAvailable;
+static BOOL g_resultNotificationActive;
+static BOOL g_resultNotificationRetryPending;
+static DWORD g_notificationOwner;
 static UINT g_alertNotificationIconId;
 static UINT_PTR g_alertTimerId;
+static UINT_PTR g_resultTimerId;
 static PM_UI_EVENT g_dispatchEvent;
 static WCHAR g_resultMessage[768];
 static PM_RULE_RUNTIME g_runtime[PM_MAX_RULES];
@@ -231,13 +236,15 @@ static INT_PTR CALLBACK RulesDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK RuleEditDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK ProcessPickerDialogProc(HWND, UINT, WPARAM, LPARAM);
 static INT_PTR CALLBACK AlertDialogProc(HWND, UINT, WPARAM, LPARAM);
-static INT_PTR CALLBACK ResultDialogProc(HWND, UINT, WPARAM, LPARAM);
 static HRESULT CALLBACK AlertTaskDialogCallback(HWND, UINT, WPARAM, LPARAM, LONG_PTR);
 static void QueueUiEvent(DWORD, const PM_INCIDENT*, const WCHAR*);
 static void ShowNextAlert();
 static void FinishCurrentAlert(BOOL);
 static void DismissAlertNotification();
+static void DismissResultNotification();
 static VOID CALLBACK AlertNotificationTimerProc(HWND, UINT, UINT_PTR, DWORD);
+static VOID CALLBACK ResultNotificationTimerProc(HWND, UINT, UINT_PTR, DWORD);
+static BOOL ShowResultNotification(const WCHAR*);
 
 static ULONGLONG FileTimeToUInt64(const FILETIME* value)
 {
@@ -2664,18 +2671,93 @@ static void ClearAllAlerts()
 	}
 }
 
-static BOOL ShowAlertNotification()
+static UINT NotificationIconId()
 {
-	if (!g_mainWindow || !g_hasCurrentAlert)
+	return g_trayIconId + 1;
+}
+
+static void DeleteNotificationIcon()
+{
+	if (!g_mainWindow)
+		return;
+	NOTIFYICONDATAW data;
+	ZeroMemory(&data, sizeof(data));
+	data.cbSize = sizeof(data);
+	data.hWnd = g_mainWindow;
+	data.uID = g_alertNotificationIconId ? g_alertNotificationIconId : NotificationIconId();
+	Shell_NotifyIconW(NIM_DELETE, &data);
+	g_notificationOwner = PM_NOTIFICATION_OWNER_NONE;
+	g_alertNotificationIconId = 0;
+}
+
+static BOOL RegisterNotificationIcon()
+{
+	if (!g_mainWindow || !g_appIcon || !g_trayIconId)
+		return FALSE;
+
+	// Keep notification delivery independent from the optional main tray icon.
+	DeleteNotificationIcon();
+	NOTIFYICONDATAW data;
+	ZeroMemory(&data, sizeof(data));
+	data.cbSize = sizeof(data);
+	data.hWnd = g_mainWindow;
+	data.uID = NotificationIconId();
+	data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	data.hIcon = g_appIcon;
+	data.uCallbackMessage = WM_PROCESS_MONITOR_NOTIFICATION;
+	CopyText(data.szTip, ARRAYSIZE(data.szTip), L"TrayS 进程监控");
+	if (!Shell_NotifyIconW(NIM_ADD, &data))
+	{
+		DWORD error = GetLastError();
+		WCHAR details[128];
+		wsprintfW(details, L"NIM_ADD failed; error=%u; icon=%u", error, data.uID);
+		Audit(L"notification-icon-add-failed", g_hasCurrentAlert ? &g_currentAlert : NULL, details);
+		return FALSE;
+	}
+	g_alertNotificationIconId = data.uID;
+	return TRUE;
+}
+
+static BOOL ShowNotificationMessage(const WCHAR* title, const WCHAR* message,
+	DWORD infoFlags, UINT timeout)
+{
+	if (!RegisterNotificationIcon())
 		return FALSE;
 
 	NOTIFYICONDATAW data;
 	ZeroMemory(&data, sizeof(data));
 	data.cbSize = sizeof(data);
 	data.hWnd = g_mainWindow;
-	data.uID = g_trayIconId;
+	data.uID = g_alertNotificationIconId;
 	data.uFlags = NIF_INFO;
-	CopyText(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle), L"TrayS 进程资源告警");
+	CopyText(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle), title);
+	CopyText(data.szInfo, ARRAYSIZE(data.szInfo), message);
+	data.dwInfoFlags = infoFlags;
+	data.uTimeout = timeout;
+	if (!Shell_NotifyIconW(NIM_MODIFY, &data))
+	{
+		DWORD error = GetLastError();
+		WCHAR details[128];
+		wsprintfW(details, L"NIM_MODIFY failed; error=%u; icon=%u", error, data.uID);
+		Audit(L"notification-show-failed", g_hasCurrentAlert ? &g_currentAlert : NULL, details);
+		DeleteNotificationIcon();
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static BOOL ShowAlertNotification()
+{
+	if (!g_mainWindow || !g_hasCurrentAlert)
+		return FALSE;
+	if (g_alertTimerId && !g_alertNotificationActive)
+	{
+		KillTimer(NULL, g_alertTimerId);
+		g_alertTimerId = 0;
+	}
+	if (g_resultNotificationActive || g_resultNotificationRetryPending)
+		DismissResultNotification();
+
 	WCHAR metrics[384];
 	FormatIncidentMetrics(&g_currentAlert, metrics, ARRAYSIZE(metrics));
 	WCHAR body[256] = L"";
@@ -2686,46 +2768,14 @@ static BOOL ShowAlertNotification()
 	AppendText(body, ARRAYSIZE(body), pidText);
 	AppendText(body, ARRAYSIZE(body), metrics);
 	AppendText(body, ARRAYSIZE(body), L"\r\n单击通知选择处理方式；关闭则暂不终止。");
-	CopyText(data.szInfo, ARRAYSIZE(data.szInfo), body);
-	data.dwInfoFlags = NIIF_WARNING;
-	data.uTimeout = PM_ALERT_TIMEOUT_MS;
-
-	if (!g_trayIconAvailable)
-	{
-		// A disabled tray icon cannot receive balloon callbacks, so create a temporary one
-		// only for the lifetime of this notification.
-		data.uID = g_trayIconId + 1;
-		data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-		data.hIcon = g_appIcon;
-		data.uCallbackMessage = WM_PROCESS_MONITOR_NOTIFICATION;
-		CopyText(data.szTip, ARRAYSIZE(data.szTip), L"TrayS 进程监控");
-		if (!Shell_NotifyIconW(NIM_ADD, &data))
-			return FALSE;
-		g_alertTemporaryTrayIcon = TRUE;
-		g_alertNotificationIconId = data.uID;
-		data.uFlags = NIF_INFO;
-	}
-	else
-		g_alertNotificationIconId = data.uID;
-
-	if (!Shell_NotifyIconW(NIM_MODIFY, &data))
-	{
-		if (g_alertTemporaryTrayIcon)
-		{
-			NOTIFYICONDATAW removeData;
-			ZeroMemory(&removeData, sizeof(removeData));
-			removeData.cbSize = sizeof(removeData);
-			removeData.hWnd = g_mainWindow;
-			removeData.uID = g_alertNotificationIconId;
-			Shell_NotifyIconW(NIM_DELETE, &removeData);
-		}
-		g_alertTemporaryTrayIcon = FALSE;
-		g_alertNotificationIconId = 0;
+	if (!ShowNotificationMessage(L"TrayS 进程资源告警", body, NIIF_WARNING, PM_ALERT_TIMEOUT_MS))
 		return FALSE;
-	}
 
 	g_alertNotificationActive = TRUE;
+	g_notificationOwner = PM_NOTIFICATION_OWNER_ALERT;
 	g_alertTimerId = SetTimer(NULL, 0, PM_ALERT_TIMEOUT_MS, AlertNotificationTimerProc);
+	if (!g_alertTimerId)
+		Audit(L"notification-timeout-timer-failed", &g_currentAlert, L"notification was shown without an expiry timer");
 	return TRUE;
 }
 
@@ -2736,40 +2786,59 @@ static void DismissAlertNotification()
 		KillTimer(NULL, g_alertTimerId);
 		g_alertTimerId = 0;
 	}
-	BOOL wasActive = g_alertNotificationActive;
-	BOOL temporary = g_alertTemporaryTrayIcon;
-	UINT iconId = g_alertNotificationIconId;
 	g_alertNotificationActive = FALSE;
-	g_alertTemporaryTrayIcon = FALSE;
-	g_alertNotificationIconId = 0;
-	if (!g_mainWindow || !iconId)
-		return;
+	if (g_notificationOwner == PM_NOTIFICATION_OWNER_ALERT)
+		DeleteNotificationIcon();
+}
 
-	NOTIFYICONDATAW data;
-	ZeroMemory(&data, sizeof(data));
-	data.cbSize = sizeof(data);
-	data.hWnd = g_mainWindow;
-	data.uID = iconId;
-	if (temporary)
+static void DismissResultNotification()
+{
+	if (g_resultTimerId)
 	{
-		Shell_NotifyIconW(NIM_DELETE, &data);
+		KillTimer(NULL, g_resultTimerId);
+		g_resultTimerId = 0;
 	}
-	else if (wasActive)
-	{
-		data.uFlags = NIF_INFO;
-		data.szInfo[0] = 0;
-		Shell_NotifyIconW(NIM_MODIFY, &data);
-	}
+	g_resultNotificationActive = FALSE;
+	g_resultNotificationRetryPending = FALSE;
+	if (g_notificationOwner == PM_NOTIFICATION_OWNER_RESULT)
+		DeleteNotificationIcon();
 }
 
 static VOID CALLBACK AlertNotificationTimerProc(HWND window, UINT message, UINT_PTR timerId, DWORD time)
 {
 	UNREFERENCED_PARAMETER(window);
 	UNREFERENCED_PARAMETER(message);
-	UNREFERENCED_PARAMETER(timerId);
 	UNREFERENCED_PARAMETER(time);
 	if (g_alertNotificationActive)
 		FinishCurrentAlert(FALSE);
+	else if (g_hasCurrentAlert && !g_alertWindow)
+	{
+		KillTimer(NULL, timerId);
+		if (g_alertTimerId == timerId)
+			g_alertTimerId = 0;
+		if (!ShowAlertNotification() && !g_alertTimerId)
+			g_alertTimerId = SetTimer(NULL, 0, 3000, AlertNotificationTimerProc);
+	}
+}
+
+static VOID CALLBACK ResultNotificationTimerProc(HWND window, UINT message, UINT_PTR timerId, DWORD time)
+{
+	UNREFERENCED_PARAMETER(window);
+	UNREFERENCED_PARAMETER(message);
+	UNREFERENCED_PARAMETER(time);
+	if (g_resultNotificationActive)
+	{
+		DismissResultNotification();
+		return;
+	}
+	if (g_resultNotificationRetryPending)
+	{
+		KillTimer(NULL, timerId);
+		if (g_resultTimerId == timerId)
+			g_resultTimerId = 0;
+		g_resultNotificationRetryPending = FALSE;
+		ShowResultNotification(g_resultMessage);
+	}
 }
 
 static HRESULT CALLBACK AlertTaskDialogCallback(HWND dialog, UINT notification, WPARAM wParam, LPARAM lParam, LONG_PTR referenceData)
@@ -2876,30 +2945,11 @@ static void ShowNextAlert()
 	if (ShowAlertNotification())
 		return;
 
-	// If the Windows notification service is unavailable, retain the native task dialog
-	// so a resource alert is never silently discarded.
-	int selectedButton = 0;
-	g_taskDialogRunning = TRUE;
-	BOOL shownBySystem = ShowSystemAlert(&selectedButton);
-	if (shownBySystem)
-	{
-		if (g_hasCurrentAlert)
-			FinishCurrentAlert(selectedButton == PM_TASK_ALERT_TERMINATE);
-		g_taskDialogRunning = FALSE;
-		ShowNextAlert();
-		return;
-	}
-	g_taskDialogRunning = FALSE;
-	// Compatibility fallback for systems where the native task dialog API cannot be loaded.
-	g_alertWindow = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_PROCESS_ALERT), NULL, AlertDialogProc, 0);
-	if (!g_alertWindow)
-	{
-		g_hasCurrentAlert = FALSE;
-		FreeIncident(&g_currentAlert);
-		return;
-	}
-	ShowWindow(g_alertWindow, SW_SHOWNORMAL);
-	SetForegroundWindow(g_alertWindow);
+	// A failed notification is retried; decision UI is opened only after a click.
+	Audit(L"notification-unavailable", &g_currentAlert,
+		L"resource alert notification failed; waiting for notification retry");
+	if (!g_alertTimerId)
+		g_alertTimerId = SetTimer(NULL, 0, 3000, AlertNotificationTimerProc);
 }
 
 static void EnqueueAlert(const PM_INCIDENT* incident)
@@ -3016,69 +3066,42 @@ static INT_PTR CALLBACK AlertDialogProc(HWND dialog, UINT message, WPARAM wParam
 	return FALSE;
 }
 
-static INT_PTR CALLBACK ResultDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+static BOOL ShowResultNotification(const WCHAR* message)
 {
-	switch (message)
+	if (!g_mainWindow || !message)
 	{
-	case WM_INITDIALOG:
-		g_resultWindow = dialog;
-		SetDlgItemTextW(dialog, IDC_PM_RESULT_TEXT, g_resultMessage);
-		SetTimer(dialog, 1, 8000, NULL);
-		return TRUE;
-	case WM_TIMER:
-		if (wParam != 1)
-			break;
-		DestroyWindow(dialog);
-		return TRUE;
-	case WM_CLOSE:
-		DestroyWindow(dialog);
-		return TRUE;
-	case WM_COMMAND:
-		if (LOWORD(wParam) == IDC_PM_RESULT_CLOSE || LOWORD(wParam) == IDCANCEL)
-		{
-			DestroyWindow(dialog);
-			return TRUE;
-		}
-		break;
-	case WM_DESTROY:
-		KillTimer(dialog, 1);
-		if (g_resultWindow == dialog) g_resultWindow = NULL;
-		return TRUE;
+		Audit(L"result-notification-skipped", NULL, L"notification window is unavailable");
+		return FALSE;
 	}
-	return FALSE;
-}
 
-static void ShowResultNotification(const WCHAR* message, BOOL trayIconAvailable)
-{
-	if (trayIconAvailable && g_mainWindow && !g_alertNotificationActive)
+	CopyText(g_resultMessage, ARRAYSIZE(g_resultMessage), message);
+	if (g_alertNotificationActive || g_hasCurrentAlert)
 	{
-		NOTIFYICONDATAW data;
-		ZeroMemory(&data, sizeof(data));
-		data.cbSize = sizeof(data);
-		data.hWnd = g_mainWindow;
-		data.uID = g_trayIconId;
-		data.uFlags = NIF_INFO;
-		CopyText(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle), L"TrayS 进程监控");
-		CopyText(data.szInfo, ARRAYSIZE(data.szInfo), message);
-		data.dwInfoFlags = NIIF_INFO;
-		Shell_NotifyIconW(NIM_MODIFY, &data);
+		Audit(L"result-notification-skipped", NULL, L"resource alert notification is pending");
+		g_resultNotificationRetryPending = TRUE;
+		if (!g_resultTimerId)
+			g_resultTimerId = SetTimer(NULL, 0, 3000, ResultNotificationTimerProc);
+		return FALSE;
 	}
-	else
+	DismissResultNotification();
+	if (!ShowNotificationMessage(L"TrayS 进程监控", g_resultMessage, NIIF_INFO,
+		PM_RESULT_NOTIFICATION_TIMEOUT_MS))
 	{
-		CopyText(g_resultMessage, ARRAYSIZE(g_resultMessage), message);
-		if (g_resultWindow)
-		{
-			SetDlgItemTextW(g_resultWindow, IDC_PM_RESULT_TEXT, g_resultMessage);
-			KillTimer(g_resultWindow, 1);
-			SetTimer(g_resultWindow, 1, 8000, NULL);
-		}
-		else
-		{
-			g_resultWindow = CreateDialogParamW(g_instance, MAKEINTRESOURCEW(IDD_PROCESS_RESULT), NULL, ResultDialogProc, 0);
-			if (g_resultWindow)
-				ShowWindow(g_resultWindow, SW_SHOWNOACTIVATE);
-		}
+		Audit(L"result-notification-unavailable", NULL,
+			L"automatic termination result was not shown as a system notification");
+		g_resultNotificationRetryPending = TRUE;
+		if (!g_resultTimerId)
+			g_resultTimerId = SetTimer(NULL, 0, 3000, ResultNotificationTimerProc);
+		return FALSE;
 	}
+
+	g_resultNotificationActive = TRUE;
+	g_notificationOwner = PM_NOTIFICATION_OWNER_RESULT;
+	g_resultNotificationRetryPending = FALSE;
+	g_resultTimerId = SetTimer(NULL, 0, PM_RESULT_NOTIFICATION_TIMEOUT_MS, ResultNotificationTimerProc);
+	if (!g_resultTimerId)
+		Audit(L"result-notification-timer-failed", NULL, L"notification was shown without an expiry timer");
+	return TRUE;
 }
 
 BOOL ProcessMonitorInitialize(HWND mainWindow, HINSTANCE instance, HICON appIcon, UINT trayIconId)
@@ -3094,10 +3117,12 @@ BOOL ProcessMonitorInitialize(HWND mainWindow, HINSTANCE instance, HICON appIcon
 	g_trayIconId = trayIconId;
 	g_taskDialogRunning = FALSE;
 	g_alertNotificationActive = FALSE;
-	g_alertTemporaryTrayIcon = FALSE;
-	g_trayIconAvailable = FALSE;
+	g_resultNotificationActive = FALSE;
+	g_resultNotificationRetryPending = FALSE;
+	g_notificationOwner = PM_NOTIFICATION_OWNER_NONE;
 	g_alertNotificationIconId = 0;
 	g_alertTimerId = 0;
+	g_resultTimerId = 0;
 	InitializeCriticalSection(&g_configLock);
 	InitializeCriticalSection(&g_uiLock);
 	InitializeCriticalSection(&g_actionLock);
@@ -3199,9 +3224,9 @@ void ProcessMonitorShutdown()
 	}
 	if (g_rulesWindow) DestroyWindow(g_rulesWindow);
 	if (g_alertWindow) DestroyWindow(g_alertWindow);
-	if (g_resultWindow) DestroyWindow(g_resultWindow);
-	g_rulesWindow = g_alertWindow = g_resultWindow = NULL;
+	g_rulesWindow = g_alertWindow = NULL;
 	ClearAllAlerts();
+	DismissResultNotification();
 	FreeIncident(&g_dispatchEvent.incident);
 	EnterCriticalSection(&g_uiLock);
 	for (DWORD index = 0; index < PM_MAX_UI_EVENTS; ++index)
@@ -3252,10 +3277,12 @@ void ProcessMonitorShutdown()
 	g_trayIconId = 0;
 	g_taskDialogRunning = FALSE;
 	g_alertNotificationActive = FALSE;
-	g_alertTemporaryTrayIcon = FALSE;
-	g_trayIconAvailable = FALSE;
+	g_resultNotificationActive = FALSE;
+	g_resultNotificationRetryPending = FALSE;
+	g_notificationOwner = PM_NOTIFICATION_OWNER_NONE;
 	g_alertNotificationIconId = 0;
 	g_alertTimerId = 0;
+	g_resultTimerId = 0;
 	g_runtimeCount = 0;
 	g_sampleCycle = 0;
 	ZeroMemory(g_states, sizeof(g_states));
@@ -3289,7 +3316,7 @@ void ProcessMonitorOpenRulesWindow(HWND owner)
 
 void ProcessMonitorDispatchUi(BOOL trayIconAvailable)
 {
-	g_trayIconAvailable = trayIconAvailable;
+	UNREFERENCED_PARAMETER(trayIconAvailable);
 	while (PopUiEvent(&g_dispatchEvent))
 	{
 		if (g_dispatchEvent.type == PM_UI_ALERT)
@@ -3300,7 +3327,7 @@ void ProcessMonitorDispatchUi(BOOL trayIconAvailable)
 		else if (g_dispatchEvent.type == PM_UI_CLEAR)
 			RemoveAlertForIncident(&g_dispatchEvent.incident);
 		else if (g_dispatchEvent.type == PM_UI_RESULT)
-			ShowResultNotification(g_dispatchEvent.message, trayIconAvailable);
+			ShowResultNotification(g_dispatchEvent.message);
 		else if (g_dispatchEvent.type == PM_UI_CLEAR_ALL)
 		{
 			ClearAllAlerts();
@@ -3345,10 +3372,29 @@ void ProcessMonitorDispatchUi(BOOL trayIconAvailable)
 	}
 }
 
+void ProcessMonitorHandleShellRestart()
+{
+	if (!g_locksInitialized || !g_mainWindow)
+		return;
+	if (g_hasCurrentAlert && !g_alertWindow)
+	{
+		if (g_alertNotificationActive)
+			DismissAlertNotification();
+		if (!ShowAlertNotification() && !g_alertTimerId)
+			g_alertTimerId = SetTimer(NULL, 0, 3000, AlertNotificationTimerProc);
+	}
+	else if (g_resultNotificationActive || g_resultNotificationRetryPending)
+	{
+		DismissResultNotification();
+		ShowResultNotification(g_resultMessage);
+	}
+}
+
 BOOL ProcessMonitorHandleNotification(WPARAM wParam, LPARAM lParam)
 {
-	UNREFERENCED_PARAMETER(wParam);
 	if (!g_alertNotificationActive)
+		return FALSE;
+	if ((UINT)wParam != g_alertNotificationIconId)
 		return FALSE;
 	UINT notification = LOWORD(lParam);
 	if (notification == NIN_BALLOONUSERCLICK)
@@ -3391,6 +3437,5 @@ BOOL ProcessMonitorIsDialogMessage(MSG* message)
 	if (!message)
 		return FALSE;
 	return (g_rulesWindow && IsDialogMessageW(g_rulesWindow, message)) ||
-		(g_alertWindow && IsDialogMessageW(g_alertWindow, message)) ||
-		(g_resultWindow && IsDialogMessageW(g_resultWindow, message));
+		(g_alertWindow && IsDialogMessageW(g_alertWindow, message));
 }

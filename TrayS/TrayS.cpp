@@ -1013,13 +1013,14 @@ BOOL RestoreShellIntegration()
 	abd.hWnd = hMain;
 	abd.uCallbackMessage = MSG_APPBAR_MSGID;
 	pSHAppBarMessage(ABM_NEW, &abd);
+	BOOL trayIconReady = TRUE;
 	if (TraySave.bTrayIcon)
-		pShell_NotifyIcon(NIM_ADD, &nid);
+		trayIconReady = pShell_NotifyIcon(NIM_ADD, &nid);
 	CloseTaskBar();
 	SetWH();
 	if (TraySave.bMonitor)
 		AdjustWindowPos();
-	return TRUE;
+	return trayIconReady;
 }
 void UpdateMainRefreshTimer()
 {
@@ -2292,8 +2293,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	nid.uCallbackMessage = WM_IAWENTRAY;
 	//			nid.dwInfoFlags = NIIF_INFO;
 	LoadString(hInst, IDS_TIPS, nid.szTip, 88);
+	BOOL trayIconReady = !TraySave.bTrayIcon;
 	if (TraySave.bTrayIcon)
-		pShell_NotifyIcon(NIM_ADD, &nid);
+		trayIconReady = pShell_NotifyIcon(NIM_ADD, &nid);
 	if (!ProcessMonitorInitialize(hMain, hInst, iMain, nid.uID))
 	{
 		ProcessMonitorShutdown();
@@ -2313,7 +2315,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	UpdateMainRefreshTimer();//自定时间处理监控窗口位置和任务栏透明
 	SetTimer(hMain, 6, 1000, NULL);//每秒处理任务栏图标
 	SetTimer(hMain, 11, 6000, NULL);//内存释放
-	if (!shellReady)
+	if (!shellReady || !trayIconReady)
 		SetTimer(hMain, 3000, 3000, NULL);//Explorer 尚未就绪时后台重试
 	hGetDataThread = CreateThread(NULL, 0, GetDataThreadProc, 0, 0, 0);
 	return hGetDataThread != NULL;
@@ -2721,8 +2723,60 @@ void SetWH()
 	ottop = -1;
 	otleft = -1;
 }
+
+static BOOL SetTaskBarParentMode(BOOL childMode)
+{
+	if (!IsWindow(hTaskBar))
+		return FALSE;
+	if (childMode && !IsWindow(hTray))
+		return FALSE;
+
+	LONG_PTR oldStyle = GetWindowLongPtr(hTaskBar, GWL_STYLE);
+	HWND oldParent = GetParent(hTaskBar);
+	BOOL oldChildMode = (oldStyle & WS_CHILD) != 0;
+	HWND requestedParent = childMode ? hTray : NULL;
+	if (oldChildMode == childMode && oldParent == requestedParent)
+		return TRUE;
+
+	RECT screenRect;
+	BOOL haveScreenRect = GetWindowRect(hTaskBar, &screenRect);
+	int x = haveScreenRect ? screenRect.left : 0;
+	int y = haveScreenRect ? screenRect.top : 0;
+	int width = haveScreenRect ? screenRect.right - screenRect.left : 0;
+	int height = haveScreenRect ? screenRect.bottom - screenRect.top : 0;
+	if (childMode && haveScreenRect)
+	{
+		POINT position = { x, y };
+		if (!ScreenToClient(hTray, &position))
+			return FALSE;
+		x = position.x;
+		y = position.y;
+	}
+
+	LONG_PTR newStyle = childMode ? ((oldStyle & ~WS_POPUP) | WS_CHILD) :
+		((oldStyle & ~WS_CHILD) | WS_POPUP);
+	SetWindowLongPtr(hTaskBar, GWL_STYLE, newStyle);
+	SetParent(hTaskBar, requestedParent);
+	LONG_PTR currentStyle = GetWindowLongPtr(hTaskBar, GWL_STYLE);
+	HWND currentParent = GetParent(hTaskBar);
+	BOOL modeApplied = ((currentStyle & WS_CHILD) != 0) == childMode && currentParent == requestedParent;
+	if (!modeApplied)
+	{
+		SetWindowLongPtr(hTaskBar, GWL_STYLE, oldStyle);
+		SetParent(hTaskBar, oldParent);
+		return FALSE;
+	}
+
+	if (haveScreenRect)
+	{
+		SetWindowPos(hTaskBar, childMode ? HWND_TOP : HWND_TOPMOST, x, y, width, height,
+			SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING | SWP_FRAMECHANGED);
+	}
+	return TRUE;
+}
+
 void AdjustWindowPos()//设置信息窗口位置大小
-{	
+{
 	if (IsWindow(hTray) == FALSE)//任务栏奔溃时重启
 	{
 		DestroyWindow(hTime);
@@ -2738,6 +2792,25 @@ void AdjustWindowPos()//设置信息窗口位置大小
 	}
 	if (IsWindow(hTaskBar) == FALSE)
 		OpenTaskBar();
+	if (IsWindow(hTaskBar) == FALSE)
+		return;
+	BOOL shouldParentTaskBar = !TraySave.bMonitorFloat && !bFullScreen;
+	LONG_PTR taskBarStyle = GetWindowLongPtr(hTaskBar, GWL_STYLE);
+	BOOL taskBarIsChild = (taskBarStyle & WS_CHILD) != 0 && GetParent(hTaskBar) == hTray;
+	BOOL taskBarModeMatches = shouldParentTaskBar ? taskBarIsChild :
+		((taskBarStyle & WS_CHILD) == 0 && GetParent(hTaskBar) == NULL);
+	if (!taskBarModeMatches)
+	{
+		BOOL previousTaskBarIsChild = taskBarIsChild;
+		SetTaskBarParentMode(shouldParentTaskBar);
+		taskBarStyle = GetWindowLongPtr(hTaskBar, GWL_STYLE);
+		taskBarIsChild = (taskBarStyle & WS_CHILD) != 0 && GetParent(hTaskBar) == hTray;
+		if (taskBarIsChild != previousTaskBarIsChild)
+		{
+			otleft = -1;
+			ottop = -1;
+		}
+	}
 	if (TraySave.bSecond && IsWindow(hTime) == FALSE)
 		OpenTimeDlg();
 	if (TraySave.bMonitorFloat)
@@ -2792,14 +2865,15 @@ void AdjustWindowPos()//设置信息窗口位置大小
 			}
 		*/
 		RECT trayrc;
-		GetWindowRect(hTray, &trayrc);
+		if (!GetWindowRect(hTray, &trayrc))
+			return;
 		if (trayrc.right - trayrc.left > trayrc.bottom - trayrc.top)
 			VTray = FALSE;
 		else
 			VTray = TRUE;
 		if (VTray == FALSE)
 		{
-			int nleft;
+			int nleft = trayrc.left;
 			if (hWin11UI)
 			{
 				RECT startrc, tasklistrc;
@@ -2827,8 +2901,10 @@ void AdjustWindowPos()//设置信息窗口位置大小
 							if (!bLeft)
 							{
 								RECT tnrc;
-								GetWindowRect(hTrayNotifyWnd, &tnrc);
-								nleft = tnrc.left - mWidth;
+								if (GetWindowRect(hTrayNotifyWnd, &tnrc))
+									nleft = tnrc.left - mWidth;
+								else
+									nleft = trayrc.right - mWidth;
 							}
 							else
 							{
@@ -2843,7 +2919,8 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				if (TraySave.bNear)
 				{
 					RECT tasklistrc;
-					GetWindowRect(hTaskListWnd, &tasklistrc);
+					if (!GetWindowRect(hTaskListWnd, &tasklistrc))
+						tasklistrc = trayrc;
 					if (TraySave.bMonitorLeft)
 						nleft = tasklistrc.left - mWidth;
 					else
@@ -2852,7 +2929,8 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				else
 				{
 					RECT taskrc;
-					GetWindowRect(hTaskWnd, &taskrc);
+					if (!GetWindowRect(hTaskWnd, &taskrc))
+						taskrc = trayrc;
 					if (TraySave.bMonitorLeft)
 						nleft = taskrc.left + 2;
 					else
@@ -2869,8 +2947,15 @@ void AdjustWindowPos()//设置信息窗口位置大小
 			else
 				ntop = (trayrc.bottom - trayrc.top - h) / 2 + trayrc.top;
 			//		if (!hWin11UI)
-			if(!bFullScreen)
-				ntop -= trayrc.top;
+			if (taskBarIsChild)
+			{
+				POINT position = { nleft, ntop };
+				if (ScreenToClient(hTray, &position))
+				{
+					nleft = position.x;
+					ntop = position.y;
+				}
+			}
 /*
 			if (hWin11UI)
 				ntop += 1;
@@ -2890,32 +2975,40 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				ottop = ntop;
 				//			::InvalidateRect(hTaskBar, NULL, TRUE);
 				//			if (!hWin11UI)
-				if(bFullScreen)
-					SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
-				else
+				if (taskBarIsChild)
 					MoveWindow(hTaskBar, nleft, ntop, mWidth, h, TRUE);
+				else
+					SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
 				
 				//			else
 				//				SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
 			}
 			//		else if(hWin11UI)
 			//			SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW);
-			if(bFullScreen)
+			if(!taskBarIsChild)
 				SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, mWidth, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW);
 		}
 		else
 		{
 			int ntop;
 			RECT taskrc;
-			GetWindowRect(hTaskWnd, &taskrc);
+			if (!GetWindowRect(hTaskWnd, &taskrc))
+				taskrc = trayrc;
 			if (TraySave.bMonitorLeft)
 				ntop = taskrc.top+2;
 			else
 				ntop = taskrc.bottom - mHeight;
-			int nleft = 1;
+			int nleft = trayrc.left + 1;
 			int w = trayrc.right - trayrc.left - 2;
-			if (bFullScreen)
-				nleft = trayrc.left + 1;
+			if (taskBarIsChild)
+			{
+				POINT position = { nleft, ntop };
+				if (ScreenToClient(hTray, &position))
+				{
+					nleft = position.x;
+					ntop = position.y;
+				}
+			}
 			if (ntop != ottop || otleft != w)
 			{
 				/*
@@ -2929,10 +3022,10 @@ void AdjustWindowPos()//设置信息窗口位置大小
 				*/
 				ottop = ntop;
 				otleft = w;
-				if (bFullScreen)
-					SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, w, mHeight, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
-				else
+				if (taskBarIsChild)
 					MoveWindow(hTaskBar, nleft, ntop, w, mHeight, TRUE);
+				else
+					SetWindowPos(hTaskBar, HWND_TOPMOST, nleft, ntop, w, mHeight, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
 			}
 		}
 	}
@@ -4779,7 +4872,10 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 	if (uTaskbarCreated && message == uTaskbarCreated)
 	{
 		if (RestoreShellIntegration())
+		{
+			ProcessMonitorHandleShellRestart();
 			KillTimer(hMain, 3000);
+		}
 		else
 			SetTimer(hMain, 3000, 3000, NULL);
 		return TRUE;
@@ -4895,7 +4991,10 @@ INT_PTR CALLBACK MainProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 		else if(wParam==3000)
 		{
 			if (RestoreShellIntegration())
+			{
+				ProcessMonitorHandleShellRestart();
 				KillTimer(hDlg, 3000);
+			}
 			else
 				SetTimer(hDlg, 3000, 3000, NULL);
 		}
@@ -5214,7 +5313,10 @@ INT_PTR CALLBACK SettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			WriteReg();
 			CloseTaskBar();
 			if (TraySave.bTrayIcon)
-				pShell_NotifyIcon(NIM_ADD, &nid);
+			{
+				if (!pShell_NotifyIcon(NIM_ADD, &nid))
+					SetTimer(hMain, 3000, 3000, NULL);
+			}
 			else
 				pShell_NotifyIcon(NIM_DELETE, &nid);
 		}

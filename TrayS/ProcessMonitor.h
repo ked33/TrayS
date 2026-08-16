@@ -9,5 +9,6 @@ BOOL ProcessMonitorInitialize(HWND mainWindow, HINSTANCE instance, HICON appIcon
 void ProcessMonitorShutdown();
 void ProcessMonitorOpenRulesWindow(HWND owner);
 void ProcessMonitorDispatchUi(BOOL trayIconAvailable);
+void ProcessMonitorHandleShellRestart();
 BOOL ProcessMonitorHandleNotification(WPARAM wParam, LPARAM lParam);
 BOOL ProcessMonitorIsDialogMessage(MSG* message);
