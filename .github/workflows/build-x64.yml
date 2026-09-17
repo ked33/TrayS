@@ -19,7 +19,7 @@ env:
 jobs:
   build:
     name: MSBuild Release|x64
-    runs-on: windows-2022
+    runs-on: avrea-windows-2025-8-vcpu
     timeout-minutes: 45
 
     steps:
