@@ -105,7 +105,8 @@ typedef struct _PROCESSCPUUSAGE
 typedef struct _PROCESSTIME
 {
 	DWORD dwProcessID;
-	LARGE_INTEGER g_slgProcessTimeOld;
+	ULONGLONG previousCpuTime;
+	ULONGLONG previousTick;
 	DWORD dwSeenCycle;
 }PROCESSTIME;
 DWORD dNumProcessor = 0;//CPU数量
@@ -178,6 +179,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam);
 //HANDLE hMainThread = NULL;
 HANDLE hGetDataThread = NULL;
 HANDLE hStopEvent = NULL;
+HANDLE hTipsWakeEvent = NULL;
 CRITICAL_SECTION MonitorBackendLock;
 BOOL bMonitorBackendLockInitialized = FALSE;
 CRITICAL_SECTION MonitorDataLock;
@@ -527,7 +529,8 @@ int DrawShadowText(HDC hDC, LPCTSTR lpString, int nCount, LPRECT lpRect, UINT uF
 void FreeTemperatureDLL();//
 void LoadTemperatureDLL();//加载DLL
 void SetWH();//计算监控窗口高宽
-int GetProcessMemUsage(int);//获取内存使用大小
-void GetProcessCpuUsage(int);//获取进程CPU使用率
+BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit);//采集并按映像名合并CPU/内存占用
+void RequestTipsProcessRefresh();//弹出提示窗口时立即唤醒采集线程
+void FreeTipsProcessBuffers();
 void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit,int iUnit=0);//流量转字符串
 void ShowSelectMenu(BOOL bNet);//显示网卡/硬盘菜单

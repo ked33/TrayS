@@ -334,6 +334,47 @@ void RefreshMonitorSnapshot()
 	}
 	UnlockMonitorData();
 }
+
+typedef struct _TIPS_PROCESS_ACCUM
+{
+	WCHAR szExe[37];
+	DWORD memoryPid;
+	DWORD cpuPid;
+	SIZE_T dwMemUsage;
+	SIZE_T memoryPidUsage;
+	float fCpuUsage;
+	float cpuPidUsage;
+} TIPS_PROCESS_ACCUM;
+
+static TIPS_PROCESS_ACCUM* pTipsProcessAccum = NULL;
+static int nTipsProcessAccumCapacity = 0;
+static HMODULE hTipsPsapiModule = NULL;
+typedef BOOL(WINAPI* pfnTipsGetProcessMemoryInfo)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+static pfnTipsGetProcessMemoryInfo pTipsGetProcessMemoryInfo = NULL;
+
+void FreeTipsProcessBuffers()
+{
+	if (pTipsProcessAccum)
+	{
+		HeapFree(GetProcessHeap(), 0, pTipsProcessAccum);
+		pTipsProcessAccum = NULL;
+	}
+	nTipsProcessAccumCapacity = 0;
+	if (hTipsPsapiModule)
+	{
+		FreeLibrary(hTipsPsapiModule);
+		hTipsPsapiModule = NULL;
+	}
+	pTipsGetProcessMemoryInfo = NULL;
+}
+
+void RequestTipsProcessRefresh()
+{
+	InterlockedExchange(&bTaskTipsActive, TRUE);
+	if (hTipsWakeEvent)
+		SetEvent(hTipsWakeEvent);
+}
+
 void ResetTrafficMonitorData()
 {
 	LockMonitorBackend();
@@ -1659,6 +1700,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 		CloseHandle(hMutex);
 		ExitProcess(GetLastError());
 	}
+	hTipsWakeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	hInst = GetModuleHandle(NULL); // 将实例句柄存储在全局变量中
 	uTaskbarCreated = RegisterWindowMessage(L"TaskbarCreated");
 	typedef WINUSERAPI DWORD WINAPI RTLGETVERSION(PRTL_OSVERSIONINFOW  lpVersionInformation);
@@ -1754,6 +1796,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 			{
 				ReleaseDC(NULL, hDesktopDC);
 				hDesktopDC = NULL;
+			}
+			if (hTipsWakeEvent)
+			{
+				CloseHandle(hTipsWakeEvent);
+				hTipsWakeEvent = NULL;
 			}
 			if (hStopEvent)
 			{
@@ -1859,6 +1906,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 		HeapFree(GetProcessHeap(), 0, pProcessTime);
 		pProcessTime = NULL;
 		nProcessTimeCapacity = 0;
+		FreeTipsProcessBuffers();
+		if (hTipsWakeEvent)
+		{
+			CloseHandle(hTipsWakeEvent);
+			hTipsWakeEvent = NULL;
+		}
 //			HeapDestroy(g_hHeapWindowInfo);
 		FreeTemperatureDLL();
 		if (hDesktopDC)
@@ -1895,6 +1948,7 @@ int iGetAddressTime = 10;//10秒一次获取网卡信息
 DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 {
 	DWORD lastThemeMode = GetSystemUsesLightTheme();
+	BOOL waitForCpuFollowup = FALSE;
 	while (WaitForSingleObject(hStopEvent, 0) == WAIT_TIMEOUT)
 	{
 		DWORD dStart = GetTickCount();
@@ -1903,6 +1957,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 		settings = MonitorSettings;
 		UnlockMonitorData();
 		BOOL tipsActive = InterlockedCompareExchange(&bTaskTipsActive, FALSE, FALSE) != FALSE;
+		BOOL cpuSampleReady = TRUE;
 		if (settings.bMonitor || tipsActive)
 		{
 			LockMonitorBackend();
@@ -1918,46 +1973,21 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			}
 			if (tipsActive)
 			{
-				nProcess = 0;
-				if (settings.bTipsMemory || settings.bTipsCPU)
-					nProcess = GetProcessMemUsage(settings.bTipsMemory ? settings.TipsMemoryRows : 0);
+				int memoryLimit = settings.bTipsMemory ? (int)settings.TipsMemoryRows : 0;
+				int cpuLimit = settings.bTipsCPU ? (int)settings.TipsCPURows : 0;
+				if (memoryLimit > 0 || cpuLimit > 0)
+					cpuSampleReady = CollectTipsProcessUsage(memoryLimit, cpuLimit);
 				else
+				{
 					ZeroMemory(pmuWork, sizeof(pmuWork));
-				if (settings.bTipsCPU)
-				{
-					int requiredProcessCapacity = nProcess + 32;
-					if (requiredProcessCapacity > nProcessTimeCapacity)
-					{
-						PROCESSTIME* resizedProcessTime = pProcessTime
-							? (PROCESSTIME*)HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pProcessTime, sizeof(PROCESSTIME) * requiredProcessCapacity)
-							: (PROCESSTIME*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PROCESSTIME) * requiredProcessCapacity);
-						if (resizedProcessTime)
-						{
-							pProcessTime = resizedProcessTime;
-							nProcessTimeCapacity = requiredProcessCapacity;
-						}
-					}
-					GetProcessCpuUsage(settings.TipsCPURows);
-				}
-				else
-				{
 					ZeroMemory(pcuWork, sizeof(pcuWork));
-					if (pProcessTime != NULL)
-					{
-						HeapFree(GetProcessHeap(), 0, pProcessTime);
-						pProcessTime = NULL;
-						nProcessTimeCapacity = 0;
-					}
 				}
+				RefreshMonitorSnapshot();
+				if (hMain)
+					PostMessage(hMain, WM_TRAYS_REFRESH_UI, 0, 0);
 			}
 			else
 			{
-				if (pProcessTime != NULL)
-				{
-					HeapFree(GetProcessHeap(), 0, pProcessTime);
-					pProcessTime = NULL;
-					nProcessTimeCapacity = 0;
-				}
 				ZeroMemory(pmuWork, sizeof(pmuWork));
 				ZeroMemory(pcuWork, sizeof(pcuWork));
 			}
@@ -2247,9 +2277,20 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 
 			}
 		}
+		waitForCpuFollowup = tipsActive && settings.bTipsCPU && !cpuSampleReady;
+		DWORD waitMs = waitForCpuFollowup ? 280 : 988;
 		DWORD dTime = GetTickCount() - dStart;
-		if (dTime < 988)
-			WaitForSingleObject(hStopEvent, 988 - dTime);
+		if (dTime < waitMs)
+		{
+			HANDLE waits[2];
+			DWORD waitCount = 0;
+			if (hStopEvent)
+				waits[waitCount++] = hStopEvent;
+			if (hTipsWakeEvent)
+				waits[waitCount++] = hTipsWakeEvent;
+			if (waitCount)
+				WaitForMultipleObjects(waitCount, waits, FALSE, waitMs - dTime);
+		}
 	}
 	return 0;
 }
@@ -3696,170 +3737,279 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	return (INT_PTR)FALSE;
 }
 
-void GetProcessCpuUsage(int limit)//获取CPU占用最高的进程
+static BOOL EnsureTipsMemoryApi()
 {
-	static DWORD sampleCycle = 0;
-	if (limit < 1)
+	if (pTipsGetProcessMemoryInfo)
+		return TRUE;
+	HMODULE kernel = GetModuleHandle(L"kernel32.dll");
+	if (kernel)
+		pTipsGetProcessMemoryInfo = (pfnTipsGetProcessMemoryInfo)GetProcAddress(kernel, "K32GetProcessMemoryInfo");
+	if (!pTipsGetProcessMemoryInfo)
 	{
-		ZeroMemory(pcuWork, sizeof(pcuWork));
-		return;
+		if (!hTipsPsapiModule)
+			hTipsPsapiModule = LoadLibrary(L"psapi.dll");
+		if (hTipsPsapiModule)
+			pTipsGetProcessMemoryInfo = (pfnTipsGetProcessMemoryInfo)GetProcAddress(hTipsPsapiModule, "GetProcessMemoryInfo");
 	}
-	if (++sampleCycle == 0)
-	{
-		sampleCycle = 1;
-		if (pProcessTime)
-			ZeroMemory(pProcessTime, sizeof(PROCESSTIME) * nProcessTimeCapacity);
-	}
-	if (limit > MAX_TIPS_PROCESS_ROWS)
-		limit = MAX_TIPS_PROCESS_ROWS;
-	if (!pProcessTime || nProcessTimeCapacity < 1)
-	{
-		ZeroMemory(pcuWork, sizeof(pcuWork));
-		return;
-	}
-	for (int i = 0; i < MAX_TIPS_PROCESS_ROWS; ++i)
-		ppcuWork[i] = &pcuWork[i];
-	ZeroMemory(pcuWork, sizeof(pcuWork));
-	DWORD currentProcessId = GetCurrentProcessId();
-	PROCESSENTRY32 process = { 0 };
-	process.dwSize = sizeof(process);
-	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snapshot == INVALID_HANDLE_VALUE)
-		return;
-	BOOL hasProcess = Process32First(snapshot, &process);
-	while (hasProcess)
-	{
-		if (process.th32ProcessID != currentProcessId && pProcessTime)
-		{
-			HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.th32ProcessID);
-			if (processHandle)
-			{
-				int timeIndex = -1;
-				for (int i = 0; i < nProcessTimeCapacity; ++i)
-				{
-					if (pProcessTime[i].dwProcessID == process.th32ProcessID)
-					{
-						timeIndex = i;
-						break;
-					}
-					if (timeIndex == -1 && pProcessTime[i].dwProcessID == 0)
-						timeIndex = i;
-				}
-				FILETIME createTime, exitTime, kernelTime, userTime;
-				if (timeIndex >= 0 && GetProcessTimes(processHandle, &createTime, &exitTime, &kernelTime, &userTime))
-				{
-					LARGE_INTEGER kernel = { 0 };
-					LARGE_INTEGER user = { 0 };
-					kernel.HighPart = kernelTime.dwHighDateTime;
-					kernel.LowPart = kernelTime.dwLowDateTime;
-					user.HighPart = userTime.dwHighDateTime;
-					user.LowPart = userTime.dwLowDateTime;
-					LONGLONG currentTime = (kernel.QuadPart + user.QuadPart) / 10000;
-					LONGLONG previousTime = pProcessTime[timeIndex].g_slgProcessTimeOld.QuadPart;
-					pProcessTime[timeIndex].g_slgProcessTimeOld.QuadPart = currentTime;
-					pProcessTime[timeIndex].dwProcessID = process.th32ProcessID;
-					pProcessTime[timeIndex].dwSeenCycle = sampleCycle;
-					float usage = previousTime > 0
-						? (float)((currentTime - previousTime) * 100 / 1000) / dNumProcessor
-						: 0;
-					if (usage > 0 && usage <= 100)
-					{
-						int insertAt = -1;
-						for (int i = 0; i < limit; ++i)
-						{
-							if (usage >= ppcuWork[i]->fCpuUsage)
-							{
-								insertAt = i;
-								break;
-							}
-						}
-						if (insertAt >= 0)
-						{
-							PROCESSCPUUSAGE* recycled = ppcuWork[limit - 1];
-							for (int i = limit - 1; i > insertAt; --i)
-								ppcuWork[i] = ppcuWork[i - 1];
-							ppcuWork[insertAt] = recycled;
-							recycled->dwProcessID = process.th32ProcessID;
-							recycled->fCpuUsage = usage;
-							lstrcpyn(recycled->szExe, process.szExeFile, ARRAYSIZE(recycled->szExe));
-						}
-					}
-				}
-				CloseHandle(processHandle);
-			}
-		}
-		hasProcess = Process32Next(snapshot, &process);
-	}
-	CloseHandle(snapshot);
-	if (pProcessTime)
-	{
-		for (int i = 0; i < nProcessTimeCapacity; ++i)
-			if (pProcessTime[i].dwSeenCycle != sampleCycle)
-				ZeroMemory(&pProcessTime[i], sizeof(pProcessTime[i]));
-	}
+	return pTipsGetProcessMemoryInfo != NULL;
 }
 
-int GetProcessMemUsage(int limit)//获取内存占用最高的进程；limit为0时仅统计进程数量
+static BOOL QueryTipsPrivateBytes(HANDLE process, SIZE_T* bytes)
 {
-	typedef BOOL(WINAPI* pfnGetProcessMemoryInfo)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
-	pfnGetProcessMemoryInfo getProcessMemoryInfo = NULL;
-	HMODULE psapiModule = NULL;
-	HMODULE kernelModule = GetModuleHandle(L"kernel32.dll");
-	if (kernelModule)
-		getProcessMemoryInfo = (pfnGetProcessMemoryInfo)GetProcAddress(kernelModule, "K32GetProcessMemoryInfo");
-	if (!getProcessMemoryInfo)
+	if (!process || !bytes || !EnsureTipsMemoryApi())
+		return FALSE;
+	SIZE_T privateBytes = 0;
+#if defined(NTDDI_WIN10_VB) && NTDDI_VERSION >= NTDDI_WIN10_VB
+	PROCESS_MEMORY_COUNTERS_EX2 counters;
+	ZeroMemory(&counters, sizeof(counters));
+	counters.cb = sizeof(counters);
+	if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)))
 	{
-		psapiModule = LoadLibrary(L"psapi.dll");
-		if (psapiModule)
-			getProcessMemoryInfo = (pfnGetProcessMemoryInfo)GetProcAddress(psapiModule, "GetProcessMemoryInfo");
+		privateBytes = (SIZE_T)counters.PrivateWorkingSetSize;
+		if (privateBytes == 0)
+			privateBytes = (SIZE_T)counters.PrivateUsage;
+		if (privateBytes == 0)
+			privateBytes = counters.WorkingSetSize;
+		*bytes = privateBytes;
+		return TRUE;
 	}
-	if (limit < 0)
-		limit = 0;
-	if (limit > MAX_TIPS_PROCESS_ROWS)
-		limit = MAX_TIPS_PROCESS_ROWS;
+#endif
+	PROCESS_MEMORY_COUNTERS_EX legacy;
+	ZeroMemory(&legacy, sizeof(legacy));
+	legacy.cb = sizeof(legacy);
+	if (!pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&legacy, sizeof(legacy)))
+		return FALSE;
+	privateBytes = (SIZE_T)legacy.PrivateUsage;
+	if (privateBytes == 0)
+		privateBytes = legacy.WorkingSetSize;
+	*bytes = privateBytes;
+	return TRUE;
+}
+
+static BOOL EnsureTipsAccumCapacity(int needed)
+{
+	if (needed <= nTipsProcessAccumCapacity)
+		return TRUE;
+	int next = nTipsProcessAccumCapacity > 0 ? nTipsProcessAccumCapacity : 64;
+	while (next < needed)
+		next *= 2;
+	TIPS_PROCESS_ACCUM* resized = pTipsProcessAccum
+		? (TIPS_PROCESS_ACCUM*)HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pTipsProcessAccum, sizeof(TIPS_PROCESS_ACCUM) * next)
+		: (TIPS_PROCESS_ACCUM*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TIPS_PROCESS_ACCUM) * next);
+	if (!resized)
+		return FALSE;
+	pTipsProcessAccum = resized;
+	nTipsProcessAccumCapacity = next;
+	return TRUE;
+}
+
+static int FindTipsProcessTimeSlot(DWORD pid)
+{
+	int freeIndex = -1;
+	for (int i = 0; i < nProcessTimeCapacity; ++i)
+	{
+		if (pProcessTime[i].dwProcessID == pid)
+			return i;
+		if (freeIndex == -1 && pProcessTime[i].dwProcessID == 0)
+			freeIndex = i;
+	}
+	if (freeIndex >= 0)
+		return freeIndex;
+	int next = nProcessTimeCapacity > 0 ? nProcessTimeCapacity * 2 : 128;
+	PROCESSTIME* resized = pProcessTime
+		? (PROCESSTIME*)HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, pProcessTime, sizeof(PROCESSTIME) * next)
+		: (PROCESSTIME*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PROCESSTIME) * next);
+	if (!resized)
+		return -1;
+	int index = nProcessTimeCapacity;
+	pProcessTime = resized;
+	nProcessTimeCapacity = next;
+	return index;
+}
+
+static TIPS_PROCESS_ACCUM* AddOrGetTipsAccum(const WCHAR* exe, int* count)
+{
+	if (!exe || !count)
+		return NULL;
+	for (int i = 0; i < *count; ++i)
+	{
+		if (lstrcmpi(pTipsProcessAccum[i].szExe, exe) == 0)
+			return &pTipsProcessAccum[i];
+	}
+	if (!EnsureTipsAccumCapacity(*count + 1))
+		return NULL;
+	TIPS_PROCESS_ACCUM* item = &pTipsProcessAccum[*count];
+	ZeroMemory(item, sizeof(*item));
+	lstrcpyn(item->szExe, exe, ARRAYSIZE(item->szExe));
+	++(*count);
+	return item;
+}
+
+static void InsertTipsMemoryRow(int limit, DWORD pid, SIZE_T mem, const WCHAR* exe)
+{
+	if (limit < 1 || mem == 0 || !exe)
+		return;
+	int insertAt = -1;
+	for (int i = 0; i < limit; ++i)
+	{
+		if (mem >= ppmuWork[i]->dwMemUsage)
+		{
+			insertAt = i;
+			break;
+		}
+	}
+	if (insertAt < 0)
+		return;
+	PROCESSMEMORYUSAGE* recycled = ppmuWork[limit - 1];
+	for (int i = limit - 1; i > insertAt; --i)
+		ppmuWork[i] = ppmuWork[i - 1];
+	ppmuWork[insertAt] = recycled;
+	recycled->dwProcessID = pid;
+	recycled->dwMemUsage = mem;
+	lstrcpyn(recycled->szExe, exe, ARRAYSIZE(recycled->szExe));
+}
+
+static void InsertTipsCpuRow(int limit, DWORD pid, float usage, const WCHAR* exe)
+{
+	if (limit < 1 || usage <= 0 || !exe)
+		return;
+	if (usage > 100)
+		usage = 100;
+	int insertAt = -1;
+	for (int i = 0; i < limit; ++i)
+	{
+		if (usage >= ppcuWork[i]->fCpuUsage)
+		{
+			insertAt = i;
+			break;
+		}
+	}
+	if (insertAt < 0)
+		return;
+	PROCESSCPUUSAGE* recycled = ppcuWork[limit - 1];
+	for (int i = limit - 1; i > insertAt; --i)
+		ppcuWork[i] = ppcuWork[i - 1];
+	ppcuWork[insertAt] = recycled;
+	recycled->dwProcessID = pid;
+	recycled->fCpuUsage = usage;
+	lstrcpyn(recycled->szExe, exe, ARRAYSIZE(recycled->szExe));
+}
+
+BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
+{
+	static DWORD sampleCycle = 0;
+	if (memoryLimit < 0)
+		memoryLimit = 0;
+	if (cpuLimit < 0)
+		cpuLimit = 0;
+	if (memoryLimit > MAX_TIPS_PROCESS_ROWS)
+		memoryLimit = MAX_TIPS_PROCESS_ROWS;
+	if (cpuLimit > MAX_TIPS_PROCESS_ROWS)
+		cpuLimit = MAX_TIPS_PROCESS_ROWS;
 	for (int i = 0; i < MAX_TIPS_PROCESS_ROWS; ++i)
+	{
 		ppmuWork[i] = &pmuWork[i];
+		ppcuWork[i] = &pcuWork[i];
+	}
 	ZeroMemory(pmuWork, sizeof(pmuWork));
+	ZeroMemory(pcuWork, sizeof(pcuWork));
+	nProcess = 0;
+	if (memoryLimit < 1 && cpuLimit < 1)
+		return TRUE;
+	if (cpuLimit > 0)
+	{
+		if (++sampleCycle == 0)
+		{
+			sampleCycle = 1;
+			if (pProcessTime)
+				ZeroMemory(pProcessTime, sizeof(PROCESSTIME) * nProcessTimeCapacity);
+		}
+	}
 	PROCESSENTRY32 process = { 0 };
 	process.dwSize = sizeof(process);
-	int processCount = 0;
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 	if (snapshot == INVALID_HANDLE_VALUE)
-	{
-		if (psapiModule)
-			FreeLibrary(psapiModule);
-		return processCount;
-	}
+		return cpuLimit < 1;
+	int accumCount = 0;
+	BOOL hadCpuDelta = FALSE;
+	DWORD currentProcessId = GetCurrentProcessId();
+	ULONGLONG now = GetTickCount64();
+	DWORD processors = dNumProcessor ? dNumProcessor : 1;
 	BOOL hasProcess = Process32First(snapshot, &process);
 	while (hasProcess)
 	{
-		++processCount;
-		if (limit > 0 && getProcessMemoryInfo && lstrcmp(process.szExeFile, L"Memory Compression") != 0)
+		++nProcess;
+		DWORD pid = process.th32ProcessID;
+		if (pid != 0 && lstrcmp(process.szExeFile, L"Memory Compression") != 0)
 		{
-			HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.th32ProcessID);
+			HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 			if (processHandle)
 			{
-				PROCESS_MEMORY_COUNTERS_EX counters = { 0 };
-				if (getProcessMemoryInfo(processHandle, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)))
+				SIZE_T privateBytes = 0;
+				BOOL haveMemory = FALSE;
+				if (memoryLimit > 0)
+					haveMemory = QueryTipsPrivateBytes(processHandle, &privateBytes);
+				float usage = 0;
+				BOOL haveCpu = FALSE;
+				if (cpuLimit > 0 && pid != currentProcessId)
 				{
-					int insertAt = -1;
-					for (int i = 0; i < limit; ++i)
+					int timeIndex = FindTipsProcessTimeSlot(pid);
+					FILETIME createTime, exitTime, kernelTime, userTime;
+					if (timeIndex >= 0 && GetProcessTimes(processHandle, &createTime, &exitTime, &kernelTime, &userTime))
 					{
-						if (counters.WorkingSetSize >= ppmuWork[i]->dwMemUsage)
+						ULONGLONG cpuNow = ((ULONGLONG)kernelTime.dwHighDateTime << 32 | kernelTime.dwLowDateTime)
+							+ ((ULONGLONG)userTime.dwHighDateTime << 32 | userTime.dwLowDateTime);
+						if (pProcessTime[timeIndex].dwProcessID == pid && pProcessTime[timeIndex].previousTick != 0)
 						{
-							insertAt = i;
-							break;
+							ULONGLONG elapsed = now - pProcessTime[timeIndex].previousTick;
+							if (elapsed >= 50 && elapsed <= 4000 && cpuNow >= pProcessTime[timeIndex].previousCpuTime)
+							{
+								ULONGLONG elapsed100ns = elapsed * 10000ULL;
+								ULONGLONG denom = elapsed100ns * processors;
+								if (denom)
+								{
+									usage = (float)(((double)(cpuNow - pProcessTime[timeIndex].previousCpuTime) * 100.0) / (double)denom);
+									if (usage < 0)
+										usage = 0;
+									if (usage > 100)
+										usage = 100;
+								}
+								haveCpu = TRUE;
+								hadCpuDelta = TRUE;
+							}
 						}
+						pProcessTime[timeIndex].previousCpuTime = cpuNow;
+						pProcessTime[timeIndex].previousTick = now;
+						pProcessTime[timeIndex].dwProcessID = pid;
+						pProcessTime[timeIndex].dwSeenCycle = sampleCycle;
 					}
-					if (insertAt >= 0)
+				}
+				if ((haveMemory && privateBytes > 0) || (haveCpu && usage > 0))
+				{
+					TIPS_PROCESS_ACCUM* item = AddOrGetTipsAccum(process.szExeFile, &accumCount);
+					if (item)
 					{
-						PROCESSMEMORYUSAGE* recycled = ppmuWork[limit - 1];
-						for (int i = limit - 1; i > insertAt; --i)
-							ppmuWork[i] = ppmuWork[i - 1];
-						ppmuWork[insertAt] = recycled;
-						recycled->dwProcessID = process.th32ProcessID;
-						recycled->dwMemUsage = counters.WorkingSetSize;
-						lstrcpyn(recycled->szExe, process.szExeFile, ARRAYSIZE(recycled->szExe));
+						if (haveMemory && privateBytes > 0)
+						{
+							SIZE_T next = item->dwMemUsage + privateBytes;
+							item->dwMemUsage = next < item->dwMemUsage ? (SIZE_T)-1 : next;
+							if (privateBytes >= item->memoryPidUsage)
+							{
+								item->memoryPidUsage = privateBytes;
+								item->memoryPid = pid;
+							}
+						}
+						if (haveCpu && usage > 0)
+						{
+							item->fCpuUsage += usage;
+							if (item->fCpuUsage > 100)
+								item->fCpuUsage = 100;
+							if (usage >= item->cpuPidUsage)
+							{
+								item->cpuPidUsage = usage;
+								item->cpuPid = pid;
+							}
+						}
 					}
 				}
 				CloseHandle(processHandle);
@@ -3868,9 +4018,21 @@ int GetProcessMemUsage(int limit)//获取内存占用最高的进程；limit为0
 		hasProcess = Process32Next(snapshot, &process);
 	}
 	CloseHandle(snapshot);
-	if (psapiModule)
-		FreeLibrary(psapiModule);
-	return processCount;
+	if (pProcessTime && cpuLimit > 0)
+	{
+		for (int i = 0; i < nProcessTimeCapacity; ++i)
+		{
+			if (pProcessTime[i].dwSeenCycle != sampleCycle)
+				ZeroMemory(&pProcessTime[i], sizeof(pProcessTime[i]));
+		}
+	}
+	for (int i = 0; i < accumCount; ++i)
+	{
+		const TIPS_PROCESS_ACCUM* item = &pTipsProcessAccum[i];
+		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->dwMemUsage, item->szExe);
+		InsertTipsCpuRow(cpuLimit, item->cpuPid, item->fCpuUsage, item->szExe);
+	}
+	return cpuLimit < 1 ? TRUE : hadCpuDelta;
 }
 void DrawDisk(HDC mdc, LPRECT lpRect, double dwByte, BOOL bReadWrite, const TRAYSAVE& settings)
 {
@@ -4151,10 +4313,16 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 /*
 			if (s_in_byte == 0)
 				return FALSE;
-*/			
+*/
+			RequestTipsProcessRefresh();
 			if (!IsWindow(hTaskTips))
 			{
 				hTaskTips = ::CreateDialog(hInst, MAKEINTRESOURCE(IDD_TIPS), NULL, (DLGPROC)TaskTipsProc);
+				if (!IsWindow(hTaskTips))
+				{
+					InterlockedExchange(&bTaskTipsActive, FALSE);
+					break;
+				}
 				SetLayeredWindowAttributes(hTaskTips, 0, 255, LWA_ALPHA);
 			}
 				HDC mdc = GetDC(hMain);
