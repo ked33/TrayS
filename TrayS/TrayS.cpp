@@ -3758,31 +3758,24 @@ static BOOL QueryTipsPrivateBytes(HANDLE process, SIZE_T* bytes)
 {
 	if (!process || !bytes || !EnsureTipsMemoryApi())
 		return FALSE;
-	SIZE_T privateBytes = 0;
-#if defined(NTDDI_WIN10_VB) && NTDDI_VERSION >= NTDDI_WIN10_VB
-	PROCESS_MEMORY_COUNTERS_EX2 counters;
+	// System Informer PHPRTLC_PRIVATEBYTES uses VmCounters.PagefileUsage.
+	// PrivateUsage is documented as the same commit-charge value.
+	PROCESS_MEMORY_COUNTERS_EX counters;
 	ZeroMemory(&counters, sizeof(counters));
 	counters.cb = sizeof(counters);
 	if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)))
 	{
-		privateBytes = (SIZE_T)counters.PrivateWorkingSetSize;
-		if (privateBytes == 0)
-			privateBytes = (SIZE_T)counters.PrivateUsage;
-		if (privateBytes == 0)
-			privateBytes = counters.WorkingSetSize;
-		*bytes = privateBytes;
+		*bytes = (SIZE_T)counters.PrivateUsage;
+		if (*bytes == 0)
+			*bytes = counters.PagefileUsage;
 		return TRUE;
 	}
-#endif
-	PROCESS_MEMORY_COUNTERS_EX legacy;
-	ZeroMemory(&legacy, sizeof(legacy));
-	legacy.cb = sizeof(legacy);
-	if (!pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&legacy, sizeof(legacy)))
+	PROCESS_MEMORY_COUNTERS basic;
+	ZeroMemory(&basic, sizeof(basic));
+	basic.cb = sizeof(basic);
+	if (!pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&basic, sizeof(basic)))
 		return FALSE;
-	privateBytes = (SIZE_T)legacy.PrivateUsage;
-	if (privateBytes == 0)
-		privateBytes = legacy.WorkingSetSize;
-	*bytes = privateBytes;
+	*bytes = basic.PagefileUsage;
 	return TRUE;
 }
 
