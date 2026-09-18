@@ -8,6 +8,7 @@
 
 #define IDC_BUTTON_PROCESS_MONITOR      1200
 #define IDC_PM_GLOBAL_ENABLE            1201
+#define IDC_PM_AUDIT_LOG                1260
 #define IDC_PM_RULE_LIST                1202
 #define IDC_PM_ADD                      1203
 #define IDC_PM_EDIT                     1204

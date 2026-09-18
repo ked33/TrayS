@@ -56,7 +56,10 @@
 #define PM_UI_CLEAR_ALL 4
 
 #define PM_CONFIG_MAGIC 0x31524D50
-#define PM_CONFIG_VERSION 1
+#define PM_CONFIG_VERSION 2
+#define PM_CONFIG_VERSION_V1 1
+#define PM_CONFIG_FLAG_ENABLED 0x1
+#define PM_CONFIG_FLAG_AUDIT_LOG 0x2
 
 typedef struct _PM_RULE
 {
@@ -75,6 +78,7 @@ typedef struct _PM_RULE
 typedef struct _PM_CONFIG
 {
 	BOOL enabled;
+	BOOL auditLog;
 	DWORD count;
 	ULONGLONG generation;
 	PM_RULE rules[PM_MAX_RULES]; // Paths are allocated to their actual lengths; unused slots stay small.
@@ -174,6 +178,7 @@ static CRITICAL_SECTION g_uiLock;
 static CRITICAL_SECTION g_actionLock;
 static CRITICAL_SECTION g_logLock;
 static BOOL g_locksInitialized;
+static volatile LONG g_auditLogEnabled = 0;
 static PM_CONFIG g_config;
 static WCHAR g_configStatus[256];
 static WCHAR* g_moduleDirectory;
@@ -332,6 +337,7 @@ static PM_CONFIG* CloneConfiguration(const PM_CONFIG* source)
 	if (!copy)
 		return NULL;
 	copy->enabled = source->enabled;
+	copy->auditLog = source->auditLog;
 	copy->count = source->count;
 	copy->generation = source->generation;
 	for (DWORD index = 0; index < source->count; ++index)
@@ -352,6 +358,7 @@ static void MoveConfiguration(PM_CONFIG* destination, PM_CONFIG* source)
 		return;
 	FreeConfiguration(destination);
 	destination->enabled = source->enabled;
+	destination->auditLog = source->auditLog;
 	destination->count = source->count;
 	destination->generation = source->generation;
 	for (DWORD index = 0; index < source->count; ++index)
@@ -617,7 +624,8 @@ static BOOL SaveConfigurationLocked(const PM_CONFIG* config)
 	DWORD header[6];
 	header[0] = PM_CONFIG_MAGIC;
 	header[1] = PM_CONFIG_VERSION;
-	header[2] = config->enabled;
+	header[2] = (config->enabled ? PM_CONFIG_FLAG_ENABLED : 0) |
+		(config->auditLog ? PM_CONFIG_FLAG_AUDIT_LOG : 0);
 	header[3] = config->count;
 	header[4] = offset;
 	header[5] = CalculateCrc32(payload, offset);
@@ -672,6 +680,7 @@ static BOOL CommitConfiguration(PM_CONFIG* candidate)
 	if (result)
 	{
 		MoveConfiguration(&g_config, candidate);
+		InterlockedExchange(&g_auditLogEnabled, g_config.auditLog ? 1 : 0);
 		SetConfigStatus(L"");
 	}
 	LeaveCriticalSection(&g_configLock);
@@ -718,8 +727,10 @@ static void LoadConfiguration()
 	DWORD read = 0;
 	BOOL ok = ReadFile(file, header, sizeof(header), &read, NULL) && read == sizeof(header);
 	BYTE* payload = NULL;
-	if (ok && header[0] == PM_CONFIG_MAGIC && header[1] == PM_CONFIG_VERSION &&
-		header[2] <= 1 && header[3] <= PM_MAX_RULES && header[4] <= PM_CONFIG_MAX_PAYLOAD &&
+	if (ok && header[0] == PM_CONFIG_MAGIC &&
+		((header[1] == PM_CONFIG_VERSION_V1 && header[2] <= 1) ||
+			(header[1] == PM_CONFIG_VERSION && header[2] <= (PM_CONFIG_FLAG_ENABLED | PM_CONFIG_FLAG_AUDIT_LOG))) &&
+		header[3] <= PM_MAX_RULES && header[4] <= PM_CONFIG_MAX_PAYLOAD &&
 		fileSize.QuadPart == (LONGLONG)sizeof(header) + header[4])
 	{
 		payload = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, header[4] ? header[4] : 1);
@@ -735,7 +746,16 @@ static void LoadConfiguration()
 	DWORD offset = 0;
 	if (ok)
 	{
-		g_config.enabled = header[2];
+		if (header[1] == PM_CONFIG_VERSION_V1)
+		{
+			g_config.enabled = header[2];
+			g_config.auditLog = TRUE;
+		}
+		else
+		{
+			g_config.enabled = (header[2] & PM_CONFIG_FLAG_ENABLED) ? TRUE : FALSE;
+			g_config.auditLog = (header[2] & PM_CONFIG_FLAG_AUDIT_LOG) ? TRUE : FALSE;
+		}
 		g_config.count = header[3];
 		for (DWORD index = 0; index < g_config.count && ok; ++index)
 		{
@@ -790,6 +810,7 @@ static void LoadConfiguration()
 		g_config.generation = 1;
 		SetConfigStatus(L"进程规则文件已损坏或版本不受支持，监控已安全关闭。");
 	}
+	InterlockedExchange(&g_auditLogEnabled, g_config.auditLog ? 1 : 0);
 }
 
 static void RotateLogIfNeeded(const WCHAR* path)
@@ -837,7 +858,7 @@ static BOOL WriteUtf8(HANDLE file, const WCHAR* text)
 
 static void Audit(const WCHAR* eventName, const PM_INCIDENT* incident, const WCHAR* message)
 {
-	if (!g_locksInitialized)
+	if (!g_locksInitialized || InterlockedCompareExchange(&g_auditLogEnabled, 0, 0) == 0)
 		return;
 	EnterCriticalSection(&g_logLock);
 	WCHAR* path = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, PM_MAX_PATH_CHARS * sizeof(WCHAR));
@@ -1945,6 +1966,7 @@ static void RefreshRulesList(HWND dialog)
 	ListView_DeleteAllItems(list);
 	EnterCriticalSection(&g_configLock);
 	CheckDlgButton(dialog, IDC_PM_GLOBAL_ENABLE, g_config.enabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(dialog, IDC_PM_AUDIT_LOG, g_config.auditLog ? BST_CHECKED : BST_UNCHECKED);
 	for (DWORD index = 0; index < g_config.count; ++index)
 	{
 		PM_RULE* rule = &g_config.rules[index];
@@ -2505,6 +2527,21 @@ static INT_PTR CALLBACK RulesDialogProc(HWND dialog, UINT message, WPARAM wParam
 				MessageBoxW(dialog, L"保存总开关失败。", L"进程资源监控", MB_ICONERROR | MB_OK);
 			else if (!CommitConfiguration(updated))
 				MessageBoxW(dialog, L"保存总开关失败。", L"进程资源监控", MB_ICONERROR | MB_OK);
+			RefreshRulesList(dialog);
+			return TRUE;
+		}
+		case IDC_PM_AUDIT_LOG:
+		{
+			BOOL auditLog = IsDlgButtonChecked(dialog, IDC_PM_AUDIT_LOG) == BST_CHECKED;
+			EnterCriticalSection(&g_configLock);
+			PM_CONFIG* updated = CloneConfiguration(&g_config);
+			LeaveCriticalSection(&g_configLock);
+			if (updated)
+				updated->auditLog = auditLog;
+			if (!updated)
+				MessageBoxW(dialog, L"保存日志开关失败。", L"进程资源监控", MB_ICONERROR | MB_OK);
+			else if (!CommitConfiguration(updated))
+				MessageBoxW(dialog, L"保存日志开关失败。", L"进程资源监控", MB_ICONERROR | MB_OK);
 			RefreshRulesList(dialog);
 			return TRUE;
 		}
