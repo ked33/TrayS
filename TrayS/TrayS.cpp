@@ -992,10 +992,10 @@ static SIZE MeasureTipsWindow(const TRAYSAVE& settings, int* rowHeight)
 			int minimum = (sample.cx + 8) * 100 / 36 + 1;
 			if (textSize.cx < minimum) textSize.cx = minimum;
 			GetTextExtentPoint(dc, L"9999.99GB", 9, &sample);
-			minimum = (sample.cx + 6) * 100 / 15 + 1;
+			minimum = (sample.cx + 6) * 100 / 20 + 1;
 			if (textSize.cx < minimum) textSize.cx = minimum;
 			GetTextExtentPoint(dc, L"专用内存", 4, &sample);
-			minimum = (sample.cx + 6) * 100 / 15 + 1;
+			minimum = (sample.cx + 6) * 100 / 20 + 1;
 			if (textSize.cx < minimum) textSize.cx = minimum;
 		}
 		if (old) SelectObject(dc, old);
@@ -3429,8 +3429,8 @@ void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD p
 static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const PROCESSMEMORYUSAGE* item, POINT cursor)
 {
 	const COLORREF color = RGB(0, 192, 192);
-	const int columns[] = { 40, 55, 70, 85, 100 };
-	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"物理内存", L"私有提交" };
+	const int columns[] = { 40, 60, 80, 100 };
+	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"私有提交" };
 	SetTextColor(dc, color);
 	RECT name = row;
 	name.left = 5;
@@ -3439,13 +3439,12 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 	{
 		const WCHAR* text = item ? item->szExe : L"进程";
 		DrawText(dc, text, lstrlen(text), &name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-		ULONGLONG values[4] = { 0, 0, 0, 0 };
+		ULONGLONG values[3] = { 0, 0, 0 };
 		if (item)
 		{
 			values[0] = item->privateWorkingSet;
 			values[1] = item->sharedWorkingSet;
-			values[2] = item->totalWorkingSet;
-			values[3] = item->privateCommit;
+			values[2] = item->privateCommit;
 		}
 		for (int i = 0; i < ARRAYSIZE(values); ++i)
 		{
@@ -3468,7 +3467,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 		if (item)
 			DrawTipsProcessActions(dc, row, client, item->dwProcessID, cursor, color, TRUE);
 	}
-	const int dividers[] = { 36, 40, 55, 70, 85 };
+	const int dividers[] = { 36, 40, 60, 80 };
 	for (int i = 0; i < ARRAYSIZE(dividers); ++i)
 	{
 		int x = client.right * dividers[i] / 100;
