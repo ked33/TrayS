@@ -90,7 +90,7 @@ typedef struct _TRAFFIC
 ////////////////////////////////////////////进程的内存使用数据结构
 typedef struct _PROCESSMEMORYUSAGE
 {
-	WCHAR szExe[37];
+	WCHAR szExe[MAX_PATH];
 	DWORD dwProcessID;	
 	ULONGLONG privateWorkingSet;
 	ULONGLONG sharedWorkingSet;
@@ -100,7 +100,7 @@ typedef struct _PROCESSMEMORYUSAGE
 ///////////////////////////////////////////进程的CPU使用率数据结构
 typedef struct _PROCESSCPUUSAGE
 {
-	WCHAR szExe[37];
+	WCHAR szExe[MAX_PATH];
 	DWORD dwProcessID;
 	float fCpuUsage;
 }PROCESSCPUUSAGE;

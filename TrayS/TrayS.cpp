@@ -337,7 +337,7 @@ void RefreshMonitorSnapshot()
 
 typedef struct _TIPS_PROCESS_ACCUM
 {
-	WCHAR szExe[37];
+	WCHAR szExe[MAX_PATH];
 	DWORD memoryPid;
 	DWORD cpuPid;
 	ULONGLONG privateWorkingSet;
@@ -3217,8 +3217,8 @@ static void GetTipsProcessActionRects(const RECT& row, const RECT& client, BOOL 
 	if (memoryRow)
 	{
 		SetRectEmpty(path);
-		terminate->left = client.right * 28 / 100;
-		terminate->right = client.right * 32 / 100;
+		terminate->left = client.right * 36 / 100;
+		terminate->right = client.right * 40 / 100;
 	}
 	else
 	{
@@ -3256,12 +3256,12 @@ void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD p
 static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const PROCESSMEMORYUSAGE* item, POINT cursor)
 {
 	const COLORREF color = RGB(0, 192, 192);
-	const int columns[] = { 32, 49, 66, 83, 100 };
+	const int columns[] = { 40, 55, 70, 85, 100 };
 	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"总内存", L"虚拟内存" };
 	SetTextColor(dc, color);
 	RECT name = row;
 	name.left = 5;
-	name.right = client.right * 28 / 100 - 3;
+	name.right = client.right * 36 / 100 - 3;
 	if (!item || item->dwProcessID)
 	{
 		const WCHAR* text = item ? item->szExe : L"进程";
@@ -3295,7 +3295,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 		if (item)
 			DrawTipsProcessActions(dc, row, client, item->dwProcessID, cursor, color, TRUE);
 	}
-	const int dividers[] = { 28, 32, 49, 66, 83 };
+	const int dividers[] = { 36, 40, 55, 70, 85 };
 	for (int i = 0; i < ARRAYSIZE(dividers); ++i)
 	{
 		int x = client.right * dividers[i] / 100;
@@ -3469,7 +3469,9 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 				const PROCESSCPUUSAGE& item = cpuProcesses[processRow];
 				if (item.dwProcessID)
 				{
-					DrawText(buffer, item.szExe, lstrlen(item.szExe), &row, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+					RECT name = row;
+					name.right = client.right * 100 / 178 - 3;
+					DrawText(buffer, item.szExe, lstrlen(item.szExe), &name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 					WCHAR text[32];
 					int usage = int(item.fCpuUsage * 100);
 					wsprintf(text, L"%d.%.2d%%", usage / 100, usage % 100);
@@ -3969,10 +3971,14 @@ static TIPS_PROCESS_ACCUM* AddOrGetTipsAccum(const WCHAR* exe, int* count)
 {
 	if (!exe || !count)
 		return NULL;
-	for (int i = 0; i < *count; ++i)
+	// Each service host is a separate process, even when its -k group matches another host.
+	if (lstrcmpi(exe, L"svchost.exe") != 0)
 	{
-		if (lstrcmpi(pTipsProcessAccum[i].szExe, exe) == 0)
-			return &pTipsProcessAccum[i];
+		for (int i = 0; i < *count; ++i)
+		{
+			if (lstrcmpi(pTipsProcessAccum[i].szExe, exe) == 0)
+				return &pTipsProcessAccum[i];
+		}
 	}
 	if (!EnsureTipsAccumCapacity(*count + 1))
 		return NULL;
@@ -4035,6 +4041,79 @@ static void InsertTipsCpuRow(int limit, DWORD pid, float usage, const WCHAR* exe
 	recycled->dwProcessID = pid;
 	recycled->fCpuUsage = usage;
 	lstrcpyn(recycled->szExe, exe, ARRAYSIZE(recycled->szExe));
+}
+
+static void SetTipsSvchostName(DWORD pid, WCHAR* name, int capacity)
+{
+	if (!name || capacity < 48 || lstrcmpi(name, L"svchost.exe") != 0)
+		return;
+	// A failed/unsupported command-line query must still leave each host distinguishable.
+	wsprintf(name, L"svchost.exe (PID %u)", pid);
+	typedef LONG(WINAPI* QueryProcessInfo)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+	static QueryProcessInfo query = NULL;
+	if (!query)
+	{
+		HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+		if (ntdll)
+			query = (QueryProcessInfo)GetProcAddress(ntdll, "NtQueryInformationProcess");
+	}
+	if (!query)
+		return;
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process)
+		return;
+	struct CommandLineInfo
+	{
+		USHORT Length;
+		USHORT MaximumLength;
+		PWSTR Buffer;
+	};
+	const ULONG commandLineInfoClass = 60; // ProcessCommandLineInformation (Windows 8.1+).
+	ULONG bytes = 0;
+	query(process, commandLineInfoClass, NULL, 0, &bytes);
+	if (bytes < sizeof(CommandLineInfo) || bytes > sizeof(CommandLineInfo) + 32768 * sizeof(WCHAR))
+	{
+		CloseHandle(process);
+		return;
+	}
+	BYTE* buffer = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes + sizeof(WCHAR));
+	if (!buffer)
+	{
+		CloseHandle(process);
+		return;
+	}
+	LONG status = query(process, commandLineInfoClass, buffer, bytes, NULL);
+	CloseHandle(process);
+	if (status >= 0)
+	{
+		CommandLineInfo* info = (CommandLineInfo*)buffer;
+		ULONG_PTR text = (ULONG_PTR)info->Buffer;
+		ULONG_PTR begin = (ULONG_PTR)buffer + sizeof(CommandLineInfo);
+		ULONG_PTR end = (ULONG_PTR)buffer + bytes + sizeof(WCHAR);
+		if (info->Length > 0 && info->Length % sizeof(WCHAR) == 0 && info->Length <= info->MaximumLength &&
+			text >= begin && text <= end && (ULONG_PTR)info->Length + sizeof(WCHAR) <= end - text)
+		{
+			info->Buffer[info->Length / sizeof(WCHAR)] = 0;
+			int argc = 0;
+			LPWSTR* argv = CommandLineToArgvW(info->Buffer, &argc);
+			if (argv)
+			{
+				const WCHAR* group = NULL;
+				BOOL hasP = FALSE;
+				for (int i = 1; i < argc; ++i)
+				{
+					if (lstrcmpi(argv[i], L"-k") == 0 && i + 1 < argc && argv[i + 1][0] != L'-')
+						group = argv[++i];
+					else if (lstrcmpi(argv[i], L"-p") == 0)
+						hasP = TRUE;
+				}
+				if (group && group[0] && lstrlen(group) + lstrlen(L"svchost.exe ()") + (hasP ? 2 : 0) < capacity)
+					wsprintf(name, L"svchost.exe (%s%s)", group, hasP ? L"-p" : L"");
+				LocalFree(argv);
+			}
+		}
+	}
+	HeapFree(GetProcessHeap(), 0, buffer);
 }
 
 BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
@@ -4133,7 +4212,7 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 					{
 						if (haveMemory && (privateBytes > 0 || sharedBytes > 0 || privateCommit > 0))
 						{
-							// Same-name processes remain grouped; shared pages may repeat across them.
+							// Other same-name processes remain grouped; shared pages may repeat across them.
 							item->privateWorkingSet += privateBytes;
 							item->sharedWorkingSet += sharedBytes;
 							item->privateCommit += privateCommit;
@@ -4176,6 +4255,23 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 		const TIPS_PROCESS_ACCUM* item = &pTipsProcessAccum[i];
 		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->privateWorkingSet, item->sharedWorkingSet, item->privateCommit, item->szExe);
 		InsertTipsCpuRow(cpuLimit, item->cpuPid, item->fCpuUsage, item->szExe);
+	}
+	// Query names only for displayed hosts, after both top-N lists have been selected.
+	for (int i = 0; i < memoryLimit; ++i)
+		SetTipsSvchostName(ppmuWork[i]->dwProcessID, ppmuWork[i]->szExe, ARRAYSIZE(ppmuWork[i]->szExe));
+	for (int i = 0; i < cpuLimit; ++i)
+	{
+		if (lstrcmpi(ppcuWork[i]->szExe, L"svchost.exe") != 0)
+			continue;
+		for (int j = 0; j < memoryLimit; ++j)
+		{
+			if (ppcuWork[i]->dwProcessID == ppmuWork[j]->dwProcessID)
+			{
+				lstrcpyn(ppcuWork[i]->szExe, ppmuWork[j]->szExe, ARRAYSIZE(ppcuWork[i]->szExe));
+				break;
+			}
+		}
+		SetTipsSvchostName(ppcuWork[i]->dwProcessID, ppcuWork[i]->szExe, ARRAYSIZE(ppcuWork[i]->szExe));
 	}
 	return cpuLimit < 1 ? TRUE : hadCpuDelta;
 }
@@ -4476,6 +4572,21 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			HFONT oldFont = (HFONT)SelectObject(mdc, hTipsFont);
 			SIZE tSize;
 			::GetTextExtentPoint(mdc, L"虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存", 36, &tSize);
+			if (TraySave.bTipsMemory)
+			{
+				// Keep group names and all four numeric columns readable with the chosen font.
+				SIZE textSize = { 0 };
+				const WCHAR sampleName[] = L"svchost.exe (netsvcs-p)";
+				GetTextExtentPoint(mdc, sampleName, ARRAYSIZE(sampleName) - 1, &textSize);
+				int minimumWidth = (textSize.cx + 8) * 100 / 36 + 1;
+				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
+				GetTextExtentPoint(mdc, L"9999.99GB", 9, &textSize);
+				minimumWidth = (textSize.cx + 6) * 100 / 15 + 1;
+				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
+				GetTextExtentPoint(mdc, L"专用内存", 4, &textSize);
+				minimumWidth = (textSize.cx + 6) * 100 / 15 + 1;
+				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
+			}
 			SelectObject(mdc, oldFont);
 			DeleteObject(hTipsFont);
 			::ReleaseDC(hMain, mdc);
