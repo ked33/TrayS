@@ -349,6 +349,14 @@ struct PAGEFILE_USAGE
 };
 PAGEFILE_USAGE PageFileUsage = { 0 };
 PAGEFILE_USAGE PageFileUsageSnapshot = { 0 };
+struct COMMIT_USAGE
+{
+	ULONGLONG committedBytes;
+	ULONGLONG limitBytes;
+	BOOL valid;
+};
+COMMIT_USAGE CommitUsage = { 0 };
+COMMIT_USAGE CommitUsageSnapshot = { 0 };
 DWORD CpuUsageSnapshot = 0;
 BOOL bTaskBarMoveing = FALSE;///////////////////窗口是否正在移动中
 PROCESSMEMORYUSAGE pmu[MAX_TIPS_PROCESS_ROWS];

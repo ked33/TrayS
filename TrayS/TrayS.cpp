@@ -293,6 +293,7 @@ int ReadTaskTipsSnapshot(
 	PROCESSCPUUSAGE* cpuProcesses,
 	MEMORYSTATUSEX* memoryStatus,
 	PAGEFILE_USAGE* pageFiles,
+	COMMIT_USAGE* commitUsage,
 	TRAYSAVE* settings)
 {
 	LockMonitorData();
@@ -311,6 +312,8 @@ int ReadTaskTipsSnapshot(
 		*memoryStatus = MemoryStatusSnapshot;
 	if (pageFiles)
 		*pageFiles = PageFileUsageSnapshot;
+	if (commitUsage)
+		*commitUsage = CommitUsageSnapshot;
 	if (settings)
 		*settings = MonitorSettings;
 	UnlockMonitorData();
@@ -322,6 +325,7 @@ void RefreshMonitorSnapshot()
 	MonitorDataSnapshot = *TrayData;
 	MemoryStatusSnapshot = MemoryStatusEx;
 	PageFileUsageSnapshot = PageFileUsage;
+	CommitUsageSnapshot = CommitUsage;
 	CpuUsageSnapshot = iCPU;
 	nTrafficSnapshot = nTraffic;
 	if (nTrafficSnapshot < 0)
@@ -363,6 +367,8 @@ static PSAPI_WORKING_SET_INFORMATION* pTipsWorkingSet = NULL;
 static DWORD cbTipsWorkingSet = 0;
 typedef BOOL(WINAPI* TipsEnumPageFiles)(PENUM_PAGE_FILE_CALLBACKW, LPVOID);
 static TipsEnumPageFiles pTipsEnumPageFiles = NULL;
+typedef BOOL(WINAPI* TipsGetPerformanceInfo)(PPERFORMANCE_INFORMATION, DWORD);
+static TipsGetPerformanceInfo pTipsGetPerformanceInfo = NULL;
 
 static BOOL CALLBACK CollectTipsPageFile(LPVOID context, PENUM_PAGE_FILE_INFORMATION info, LPCWSTR)
 {
@@ -400,6 +406,32 @@ static void CollectTipsPageFileUsage()
 	PageFileUsage = usage;
 }
 
+static void CollectTipsCommitUsage()
+{
+	COMMIT_USAGE usage = { 0 };
+	if (!pTipsGetPerformanceInfo)
+	{
+		HMODULE kernel = GetModuleHandle(L"kernel32.dll");
+		if (kernel)
+			pTipsGetPerformanceInfo = (TipsGetPerformanceInfo)GetProcAddress(kernel, "K32GetPerformanceInfo");
+		if (!pTipsGetPerformanceInfo)
+		{
+			if (!hTipsPsapiModule) hTipsPsapiModule = LoadLibrary(L"psapi.dll");
+			if (hTipsPsapiModule)
+				pTipsGetPerformanceInfo = (TipsGetPerformanceInfo)GetProcAddress(hTipsPsapiModule, "GetPerformanceInfo");
+		}
+	}
+	PERFORMANCE_INFORMATION info = { 0 };
+	info.cb = sizeof(info);
+	if (pTipsGetPerformanceInfo && pTipsGetPerformanceInfo(&info, sizeof(info)) && info.PageSize)
+	{
+		usage.committedBytes = (ULONGLONG)info.CommitTotal * info.PageSize;
+		usage.limitBytes = (ULONGLONG)info.CommitLimit * info.PageSize;
+		usage.valid = TRUE;
+	}
+	CommitUsage = usage;
+}
+
 // PROCESS_MEMORY_COUNTERS_EX2 layout, also usable with older build SDKs.
 struct TIPS_MEMORY_COUNTERS_EX2
 {
@@ -426,6 +458,7 @@ void FreeTipsProcessBuffers()
 	pTipsGetProcessMemoryInfo = NULL;
 	pTipsQueryWorkingSet = NULL;
 	pTipsEnumPageFiles = NULL;
+	pTipsGetPerformanceInfo = NULL;
 	if (pTipsWorkingSet)
 		HeapFree(GetProcessHeap(), 0, pTipsWorkingSet);
 	pTipsWorkingSet = NULL;
@@ -2167,6 +2200,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			if (tipsActive)
 			{
 				CollectTipsPageFileUsage();
+				CollectTipsCommitUsage();
 				int memoryLimit = settings.bTipsMemory ? (int)settings.TipsMemoryRows : 0;
 				int cpuLimit = settings.bTipsCPU ? (int)settings.TipsCPURows : 0;
 				if (memoryLimit > 0 || cpuLimit > 0)
@@ -3523,7 +3557,43 @@ static void FillTipsUsage(HDC dc, const RECT& cell, ULONGLONG used, ULONGLONG to
 	FillRect(dc, &fill, usedBrush);
 }
 
-void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, const MEMORYSTATUSEX& status, const PAGEFILE_USAGE& pageFiles)
+static void DrawTipsUsageTexts(HDC dc, const RECT* cells, const WCHAR (*texts)[96], int count)
+{
+	int scale = 1000;
+	for (int i = 0; i < count; ++i)
+	{
+		SIZE size = { 0 };
+		if (GetTextExtentPoint(dc, texts[i], lstrlen(texts[i]), &size) && size.cx > 0)
+		{
+			int width = cells[i].right - cells[i].left;
+			int fit = width > 0 ? width * 1000 / size.cx : 0;
+			if (fit < scale) scale = fit;
+		}
+	}
+	HFONT compactFont = NULL, oldFont = NULL;
+	if (scale > 0 && scale < 1000)
+	{
+		LOGFONT font;
+		HFONT currentFont = (HFONT)GetCurrentObject(dc, OBJ_FONT);
+		if (currentFont && GetObject(currentFont, sizeof(font), &font) == sizeof(font))
+		{
+			font.lfHeight = font.lfHeight * scale / 1000;
+			if (!font.lfHeight) font.lfHeight = -1;
+			font.lfWidth = font.lfWidth * scale / 1000;
+			compactFont = CreateFontIndirect(&font);
+			if (compactFont) oldFont = (HFONT)SelectObject(dc, compactFont);
+		}
+	}
+	for (int i = 0; i < count; ++i)
+	{
+		RECT cell = cells[i];
+		DrawText(dc, texts[i], lstrlen(texts[i]), &cell, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+	}
+	if (oldFont) SelectObject(dc, oldFont);
+	if (compactFont) DeleteObject(compactFont);
+}
+
+void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, const MEMORYSTATUSEX& status, const PAGEFILE_USAGE& pageFiles, const COMMIT_USAGE& commitUsage)
 {
 	RECT drives = { client.right * 8 / 100 + 3, top + 3, client.right * 92 / 100 - 2, top + rowHeight - 1 };
 	HBRUSH emptyBrush = CreateSolidBrush(RGB(168, 168, 168));
@@ -3568,20 +3638,30 @@ void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, cons
 	RECT exitButton = { client.right * 92 / 100, top, client.right, top + rowHeight };
 	DrawText(dc, L"退出", 2, &exitButton, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 	ULONGLONG usedPhys = status.ullTotalPhys >= status.ullAvailPhys ? status.ullTotalPhys - status.ullAvailPhys : 0;
-	RECT page = { client.right * 8 / 100 + 3, top + rowHeight + 3, client.right * 50 / 100 - 1, top + rowHeight * 2 - 1 };
-	RECT phys = { client.right * 50 / 100 + 1, page.top, client.right * 92 / 100 - 2, page.bottom };
-	FillTipsUsage(dc, page, pageFiles.usedBytes, pageFiles.totalBytes, emptyBrush,
+	RECT cells[3];
+	for (int i = 0; i < ARRAYSIZE(cells); ++i)
+	{
+		cells[i] = { client.right * (8 + 28 * i) / 100 + (i == 0 ? 3 : 1),
+			top + rowHeight + 3, client.right * (36 + 28 * i) / 100 - (i == 2 ? 2 : 1),
+			top + rowHeight * 2 - 1 };
+	}
+	FillTipsUsage(dc, cells[0], pageFiles.usedBytes, pageFiles.totalBytes, emptyBrush,
 		pageFiles.totalBytes && pageFiles.usedBytes > pageFiles.totalBytes - pageFiles.totalBytes / 5 ? warningBrush : memoryBrush);
-	FillTipsUsage(dc, phys, usedPhys, status.ullTotalPhys, emptyBrush,
+	FillTipsUsage(dc, cells[1], usedPhys, status.ullTotalPhys, emptyBrush,
 		status.ullTotalPhys && usedPhys > status.ullTotalPhys - status.ullTotalPhys / 5 ? warningBrush : memoryBrush);
-	WCHAR text[96];
+	FillTipsUsage(dc, cells[2], commitUsage.committedBytes, commitUsage.limitBytes, emptyBrush,
+		commitUsage.limitBytes && commitUsage.committedBytes > commitUsage.limitBytes - commitUsage.limitBytes / 5 ? warningBrush : memoryBrush);
+	WCHAR texts[3][96];
 	if (pageFiles.valid)
-		FormatTipsUsage(text, L"虚拟内存：", pageFiles.usedBytes, pageFiles.totalBytes);
+		FormatTipsUsage(texts[0], L"虚拟内存：", pageFiles.usedBytes, pageFiles.totalBytes);
 	else
-		lstrcpy(text, L"虚拟内存：不可用");
-	DrawText(dc, text, lstrlen(text), &page, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-	FormatTipsUsage(text, L"物理内存：", usedPhys, status.ullTotalPhys);
-	DrawText(dc, text, lstrlen(text), &phys, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+		lstrcpy(texts[0], L"虚拟内存：不可用");
+	FormatTipsUsage(texts[1], L"物理内存：", usedPhys, status.ullTotalPhys);
+	if (commitUsage.valid)
+		FormatTipsUsage(texts[2], L"提交内存：", commitUsage.committedBytes, commitUsage.limitBytes);
+	else
+		lstrcpy(texts[2], L"提交内存：不可用");
+	DrawTipsUsageTexts(dc, cells, texts, ARRAYSIZE(cells));
 	if (emptyBrush) DeleteObject(emptyBrush);
 	if (warningBrush) DeleteObject(warningBrush);
 	if (diskBrush) DeleteObject(diskBrush);
@@ -3599,7 +3679,7 @@ static int GetTipsVisibleRows(const RECT& client, int rowHeight)
 
 BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int trafficRows,
 	const PROCESSCPUUSAGE* cpuProcesses, int cpuRows, const PROCESSMEMORYUSAGE* memoryProcesses,
-	int memoryRows, const MEMORYSTATUSEX& memoryStatus, const PAGEFILE_USAGE& pageFiles, const TRAYSAVE& settings, int scrollOffset)
+	int memoryRows, const MEMORYSTATUSEX& memoryStatus, const PAGEFILE_USAGE& pageFiles, const COMMIT_USAGE& commitUsage, const TRAYSAVE& settings, int scrollOffset)
 {
 	RECT client;
 	GetClientRect(window, &client);
@@ -3705,7 +3785,7 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 	LineTo(buffer, client.right * 8 / 100, bottomTop + wTipsHeight * 2);
 	MoveToEx(buffer, client.right * 92 / 100, bottomTop, NULL);
 	LineTo(buffer, client.right * 92 / 100, bottomTop + wTipsHeight * 2);
-	DrawTipsBottomRows(buffer, client, bottomTop, wTipsHeight, memoryStatus, pageFiles);
+	DrawTipsBottomRows(buffer, client, bottomTop, wTipsHeight, memoryStatus, pageFiles, commitUsage);
 	BitBlt(target, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
 	if (oldPen) SelectObject(buffer, oldPen);
 	if (divider) DeleteObject(divider);
@@ -3742,6 +3822,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	static PROCESSCPUUSAGE cpuProcesses[MAX_TIPS_PROCESS_ROWS] = { 0 };
 	static MEMORYSTATUSEX memoryStatus = { 0 };
 	static PAGEFILE_USAGE pageFiles = { 0 };
+	static COMMIT_USAGE commitUsage = { 0 };
 	static TRAYSAVE displaySettings = { 0 };
 	static int trafficCount = 0;
 	static int scrollOffset = 0;
@@ -3759,6 +3840,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 				cpuProcesses,
 				&memoryStatus,
 				&pageFiles,
+				&commitUsage,
 				&displaySettings);
 			displayPaused = pauseRequested;
 			InvalidateRect(hDlg, NULL, TRUE);
@@ -3774,6 +3856,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			cpuProcesses,
 			&memoryStatus,
 			&pageFiles,
+			&commitUsage,
 			&displaySettings);
 	}
 	int trafficRows = displaySettings.bTipsTraffic ? trafficCount : 0;
@@ -3989,10 +4072,12 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 				}
 				else
 				{
-					if(pt.x<rc.right/2)
+					if (pt.x < rc.right * 36 / 100)
 						RunProcess(NULL, szCompmgmt);
-					else
+					else if (pt.x < rc.right * 64 / 100)
 						RunProcess(NULL, szPowerCpl);
+					else
+						RunProcess(NULL, szTaskmgr);
 				}
 			}
 		}
@@ -4011,6 +4096,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			memoryRows,
 			memoryStatus,
 			pageFiles,
+			commitUsage,
 			displaySettings,
 			scrollOffset);
 	}
