@@ -292,6 +292,7 @@ int ReadTaskTipsSnapshot(
 	PROCESSMEMORYUSAGE* memoryProcesses,
 	PROCESSCPUUSAGE* cpuProcesses,
 	MEMORYSTATUSEX* memoryStatus,
+	PAGEFILE_USAGE* pageFiles,
 	TRAYSAVE* settings)
 {
 	LockMonitorData();
@@ -308,6 +309,8 @@ int ReadTaskTipsSnapshot(
 		CopyMemory(cpuProcesses, pcu, sizeof(pcu));
 	if (memoryStatus)
 		*memoryStatus = MemoryStatusSnapshot;
+	if (pageFiles)
+		*pageFiles = PageFileUsageSnapshot;
 	if (settings)
 		*settings = MonitorSettings;
 	UnlockMonitorData();
@@ -318,6 +321,7 @@ void RefreshMonitorSnapshot()
 	LockMonitorData();
 	MonitorDataSnapshot = *TrayData;
 	MemoryStatusSnapshot = MemoryStatusEx;
+	PageFileUsageSnapshot = PageFileUsage;
 	CpuUsageSnapshot = iCPU;
 	nTrafficSnapshot = nTraffic;
 	if (nTrafficSnapshot < 0)
@@ -357,6 +361,44 @@ typedef BOOL(WINAPI* pfnTipsQueryWorkingSet)(HANDLE, PVOID, DWORD);
 static pfnTipsQueryWorkingSet pTipsQueryWorkingSet = NULL;
 static PSAPI_WORKING_SET_INFORMATION* pTipsWorkingSet = NULL;
 static DWORD cbTipsWorkingSet = 0;
+typedef BOOL(WINAPI* TipsEnumPageFiles)(PENUM_PAGE_FILE_CALLBACKW, LPVOID);
+static TipsEnumPageFiles pTipsEnumPageFiles = NULL;
+
+static BOOL CALLBACK CollectTipsPageFile(LPVOID context, PENUM_PAGE_FILE_INFORMATION info, LPCWSTR)
+{
+	PAGEFILE_USAGE* usage = (PAGEFILE_USAGE*)context;
+	usage->usedBytes += (ULONGLONG)info->TotalInUse;
+	usage->totalBytes += (ULONGLONG)info->TotalSize;
+	return TRUE;
+}
+
+static void CollectTipsPageFileUsage()
+{
+	PAGEFILE_USAGE usage = { 0 };
+	if (!pTipsEnumPageFiles)
+	{
+		HMODULE kernel = GetModuleHandle(L"kernel32.dll");
+		if (kernel)
+			pTipsEnumPageFiles = (TipsEnumPageFiles)GetProcAddress(kernel, "K32EnumPageFilesW");
+		if (!pTipsEnumPageFiles)
+		{
+			if (!hTipsPsapiModule) hTipsPsapiModule = LoadLibrary(L"psapi.dll");
+			if (hTipsPsapiModule)
+				pTipsEnumPageFiles = (TipsEnumPageFiles)GetProcAddress(hTipsPsapiModule, "EnumPageFilesW");
+		}
+	}
+	if (pTipsEnumPageFiles && pTipsEnumPageFiles(CollectTipsPageFile, &usage))
+	{
+		SYSTEM_INFO info;
+		GetSystemInfo(&info);
+		usage.usedBytes *= info.dwPageSize;
+		usage.totalBytes *= info.dwPageSize;
+		usage.valid = TRUE;
+	}
+	else
+		ZeroMemory(&usage, sizeof(usage));
+	PageFileUsage = usage;
+}
 
 // PROCESS_MEMORY_COUNTERS_EX2 layout, also usable with older build SDKs.
 struct TIPS_MEMORY_COUNTERS_EX2
@@ -383,6 +425,7 @@ void FreeTipsProcessBuffers()
 	}
 	pTipsGetProcessMemoryInfo = NULL;
 	pTipsQueryWorkingSet = NULL;
+	pTipsEnumPageFiles = NULL;
 	if (pTipsWorkingSet)
 		HeapFree(GetProcessHeap(), 0, pTipsWorkingSet);
 	pTipsWorkingSet = NULL;
@@ -663,6 +706,12 @@ typedef struct _TRAYSAVE_V117
 {
 	BYTE data[FIELD_OFFSET(TRAYSAVE, bTipsTraffic)];
 } TRAYSAVE_V117;
+typedef struct _TRAYSAVE_V118
+{
+	BYTE data[FIELD_OFFSET(TRAYSAVE, TipsWidth)];
+} TRAYSAVE_V118;
+static_assert(sizeof(TRAYSAVE_V118) == 688, "Unexpected v118 payload size");
+static_assert(sizeof(TRAYSAVE) == 696, "Unexpected v119 payload size");
 static_assert(FIELD_OFFSET(TRAYSAVE, bTrayStyle) == 656, "Unexpected TRAYSAVE layout");
 static_assert(FIELD_OFFSET(TRAYSAVE, bTipsTraffic) == 660, "Unexpected v117 configuration layout");
 static_assert(sizeof(TRAYSAVE_V117) == FIELD_OFFSET(TRAYSAVE, bTipsTraffic), "Unexpected v117 payload size");
@@ -670,7 +719,7 @@ static_assert(sizeof(TRAYSAVE_V116) == 1468, "Unexpected v116 configuration layo
 
 const DWORD CONFIG_MAGIC = 0x53595254; // TRYS
 const DWORD CONFIG_FORMAT_VERSION = 1;
-const DWORD CONFIG_PAYLOAD_VERSION = 118;
+const DWORD CONFIG_PAYLOAD_VERSION = 119;
 const WCHAR szTraySaveTemp[] = L"TrayS.dat.tmp";
 
 DWORD CalculateConfigChecksum(const BYTE* data, DWORD size)
@@ -715,6 +764,8 @@ void SetDefaultTipsConfig(TRAYSAVE* config)
 	config->TipsCPURows = 6;
 	config->TipsMemoryRows = 6;
 	config->TipsVisibleRows = 13;
+	config->TipsWidth = 0;
+	config->TipsHeight = 0;
 }
 
 void WriteReg();
@@ -752,7 +803,9 @@ BOOL ValidateConfig(const TRAYSAVE& config)
 	if (config.TipsTrafficRows < 1 || config.TipsTrafficRows > MAX_TIPS_TRAFFIC_ROWS ||
 		config.TipsCPURows < 1 || config.TipsCPURows > MAX_TIPS_PROCESS_ROWS ||
 		config.TipsMemoryRows < 1 || config.TipsMemoryRows > MAX_TIPS_PROCESS_ROWS ||
-		config.TipsVisibleRows < 4 || config.TipsVisibleRows > 30)
+		config.TipsVisibleRows < 1 || config.TipsVisibleRows > MAX_TIPS_VISIBLE_ROWS ||
+		(config.TipsWidth != 0 && (config.TipsWidth < 240 || config.TipsWidth > 8192)) ||
+		config.TipsHeight > 8192)
 		return FALSE;
 	if (!HasAnsiTerminator(config.AdpterName, ARRAYSIZE(config.AdpterName)) ||
 		!HasWideTerminator(config.TraybarFont.lfFaceName, ARRAYSIZE(config.TraybarFont.lfFaceName)) ||
@@ -803,6 +856,20 @@ void ReadReg()//读取设置
 					header.checksum == CalculateConfigChecksum((const BYTE*)&candidate, sizeof(candidate)))
 				{
 					valid = ValidateConfig(candidate);
+				}
+				else if (header.payloadVersion == 118 && header.payloadSize == sizeof(TRAYSAVE_V118))
+				{
+					TRAYSAVE_V118 legacy = { 0 };
+					if (ReadFile(hFile, &legacy, sizeof(legacy), &dwBytes, NULL) && dwBytes == sizeof(legacy) &&
+						header.checksum == CalculateConfigChecksum((const BYTE*)&legacy, sizeof(legacy)))
+					{
+						CopyMemory(&candidate, &legacy, sizeof(legacy));
+						candidate.Ver = CONFIG_PAYLOAD_VERSION;
+						candidate.TipsWidth = 0;
+						candidate.TipsHeight = 0;
+						valid = ValidateConfig(candidate);
+						migrateLegacy = valid;
+					}
 				}
 				else if (header.payloadVersion == 117 && header.payloadSize == sizeof(TRAYSAVE_V117))
 				{
@@ -906,6 +973,68 @@ BOOL ChooseDisplayFont(HWND owner, LOGFONT* font, int* fontSize)
 	return TRUE;
 }
 
+static SIZE MeasureTipsWindow(const TRAYSAVE& settings, int* rowHeight)
+{
+	SIZE textSize = { DPI(521), DPI(18) };
+	HDC dc = GetDC(NULL);
+	if (dc)
+	{
+		LOGFONT font = settings.TipsFont;
+		font.lfHeight = DPI(settings.TipsFontSize);
+		HFONT selected = CreateFontIndirect(&font);
+		HFONT old = selected ? (HFONT)SelectObject(dc, selected) : NULL;
+		GetTextExtentPoint(dc, L"虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存", 36, &textSize);
+		if (settings.bTipsMemory)
+		{
+			SIZE sample = { 0 };
+			const WCHAR name[] = L"svchost.exe (netsvcs-p)";
+			GetTextExtentPoint(dc, name, ARRAYSIZE(name) - 1, &sample);
+			int minimum = (sample.cx + 8) * 100 / 36 + 1;
+			if (textSize.cx < minimum) textSize.cx = minimum;
+			GetTextExtentPoint(dc, L"9999.99GB", 9, &sample);
+			minimum = (sample.cx + 6) * 100 / 15 + 1;
+			if (textSize.cx < minimum) textSize.cx = minimum;
+			GetTextExtentPoint(dc, L"专用内存", 4, &sample);
+			minimum = (sample.cx + 6) * 100 / 15 + 1;
+			if (textSize.cx < minimum) textSize.cx = minimum;
+		}
+		if (old) SelectObject(dc, old);
+		if (selected) DeleteObject(selected);
+		ReleaseDC(NULL, dc);
+	}
+	if (textSize.cy < 1) textSize.cy = 1;
+	*rowHeight = textSize.cy;
+	int rows = (int)settings.TipsVisibleRows;
+	if (rows < 1 || rows > MAX_TIPS_VISIBLE_ROWS) rows = 13;
+	SIZE size = { textSize.cx + GetSystemMetrics(SM_CXVSCROLL), textSize.cy * (rows + 2) };
+	if (settings.TipsWidth) size.cx = (LONG)settings.TipsWidth;
+	if (settings.TipsHeight) size.cy = (LONG)settings.TipsHeight;
+	return size;
+}
+
+static void SyncTipsSizeControls(HWND dialog, const TRAYSAVE& settings, BOOL fromRows)
+{
+	int rowHeight;
+	MeasureTipsWindow(settings, &rowHeight);
+	BOOL valid = FALSE;
+	if (fromRows)
+	{
+		UINT rows = GetDlgItemInt(dialog, IDC_TIPS_VISIBLE_ROWS, &valid, FALSE);
+		if (valid && rows >= 1 && rows <= MAX_TIPS_VISIBLE_ROWS)
+			SetDlgItemInt(dialog, IDC_TIPS_HEIGHT, (rows + 2) * rowHeight, FALSE);
+	}
+	else
+	{
+		UINT height = GetDlgItemInt(dialog, IDC_TIPS_HEIGHT, &valid, FALSE);
+		if (valid && height >= (UINT)(3 * rowHeight) && height <= 8192)
+		{
+			UINT rows = height / rowHeight - 2;
+			if (rows > MAX_TIPS_VISIBLE_ROWS) rows = MAX_TIPS_VISIBLE_ROWS;
+			SetDlgItemInt(dialog, IDC_TIPS_VISIBLE_ROWS, rows, FALSE);
+		}
+	}
+}
+
 void UpdateTipsSettingControls(HWND dialog)
 {
 	EnableWindow(GetDlgItem(dialog, IDC_TIPS_TRAFFIC_ROWS),
@@ -919,6 +1048,7 @@ void UpdateTipsSettingControls(HWND dialog)
 INT_PTR CALLBACK TipsSettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	UNREFERENCED_PARAMETER(lParam);
+	static BOOL syncingSize = FALSE;
 	TRAYSAVE* draft = (TRAYSAVE*)GetWindowLongPtr(hDlg, DWLP_USER);
 	switch (message)
 	{
@@ -930,6 +1060,7 @@ INT_PTR CALLBACK TipsSettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
 			return TRUE;
 		}
 		*draft = TraySave;
+		syncingSize = TRUE;
 		SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)draft);
 		SendMessage(hDlg, WM_SETICON, ICON_BIG, (LPARAM)(HICON)iMain);
 		SendMessage(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)(HICON)iMain);
@@ -943,7 +1074,17 @@ INT_PTR CALLBACK TipsSettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
 		SendDlgItemMessage(hDlg, IDC_TIPS_TRAFFIC_ROWS, EM_SETLIMITTEXT, 2, 0);
 		SendDlgItemMessage(hDlg, IDC_TIPS_CPU_ROWS, EM_SETLIMITTEXT, 2, 0);
 		SendDlgItemMessage(hDlg, IDC_TIPS_MEMORY_ROWS, EM_SETLIMITTEXT, 2, 0);
-		SendDlgItemMessage(hDlg, IDC_TIPS_VISIBLE_ROWS, EM_SETLIMITTEXT, 2, 0);
+		SendDlgItemMessage(hDlg, IDC_TIPS_VISIBLE_ROWS, EM_SETLIMITTEXT, 3, 0);
+		{
+			int rowHeight;
+			SIZE size = MeasureTipsWindow(*draft, &rowHeight);
+			SetDlgItemInt(hDlg, IDC_TIPS_WIDTH, size.cx, FALSE);
+			SetDlgItemInt(hDlg, IDC_TIPS_HEIGHT, size.cy, FALSE);
+			SendDlgItemMessage(hDlg, IDC_TIPS_WIDTH, EM_SETLIMITTEXT, 4, 0);
+			SendDlgItemMessage(hDlg, IDC_TIPS_HEIGHT, EM_SETLIMITTEXT, 4, 0);
+			SyncTipsSizeControls(hDlg, *draft, FALSE);
+		}
+		syncingSize = FALSE;
 		UpdateTipsSettingControls(hDlg);
 		return TRUE;
 	case WM_COMMAND:
@@ -954,9 +1095,22 @@ INT_PTR CALLBACK TipsSettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
 		case IDC_TIPS_MEMORY_ENABLE:
 			UpdateTipsSettingControls(hDlg);
 			return TRUE;
+		case IDC_TIPS_HEIGHT:
+		case IDC_TIPS_VISIBLE_ROWS:
+			if (HIWORD(wParam) == EN_CHANGE && draft && !syncingSize)
+			{
+				syncingSize = TRUE;
+				SyncTipsSizeControls(hDlg, *draft, LOWORD(wParam) == IDC_TIPS_VISIBLE_ROWS);
+				syncingSize = FALSE;
+			}
+			return TRUE;
 		case IDC_TIPS_CHOOSE_FONT:
-			if (draft)
-				ChooseDisplayFont(hDlg, &draft->TipsFont, &draft->TipsFontSize);
+			if (draft && ChooseDisplayFont(hDlg, &draft->TipsFont, &draft->TipsFontSize))
+			{
+				syncingSize = TRUE;
+				SyncTipsSizeControls(hDlg, *draft, FALSE);
+				syncingSize = FALSE;
+			}
 			return TRUE;
 		case IDC_TIPS_SAVE:
 		{
@@ -988,11 +1142,29 @@ INT_PTR CALLBACK TipsSettingProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
 				return TRUE;
 			}
 			DWORD visibleRows = GetDlgItemInt(hDlg, IDC_TIPS_VISIBLE_ROWS, &translated, FALSE);
-			if (!translated || visibleRows < 4 || visibleRows > 30)
+			if (!translated || visibleRows < 1 || visibleRows > MAX_TIPS_VISIBLE_ROWS)
 			{
-				MessageBox(hDlg, L"窗口可见行数必须为 4-30。", L"提示窗口设置", MB_ICONWARNING | MB_OK);
+				MessageBox(hDlg, L"窗口可见行数必须为 1-193。", L"提示窗口设置", MB_ICONWARNING | MB_OK);
 				return TRUE;
 			}
+			DWORD width = GetDlgItemInt(hDlg, IDC_TIPS_WIDTH, &translated, FALSE);
+			if (!translated || width < 240 || width > 8192)
+			{
+				MessageBox(hDlg, L"窗口宽度必须为 240-8192 像素。", L"提示窗口设置", MB_ICONWARNING | MB_OK);
+				return TRUE;
+			}
+			DWORD height = GetDlgItemInt(hDlg, IDC_TIPS_HEIGHT, &translated, FALSE);
+			int rowHeight;
+			MeasureTipsWindow(draft ? *draft : TraySave, &rowHeight);
+			if (!translated || height < (DWORD)(rowHeight * 3) || height > 8192 ||
+				height / rowHeight - 2 > MAX_TIPS_VISIBLE_ROWS)
+			{
+				MessageBox(hDlg, L"窗口高度需容纳 1-193 行列表和底部两行，且不能超过 8192 像素。", L"提示窗口设置", MB_ICONWARNING | MB_OK);
+				return TRUE;
+			}
+			visibleRows = height / rowHeight - 2;
+			TraySave.TipsWidth = width;
+			TraySave.TipsHeight = height;
 			TraySave.bTipsTraffic = showTraffic;
 			TraySave.bTipsCPU = showCPU;
 			TraySave.bTipsMemory = showMemory;
@@ -1994,6 +2166,7 @@ DWORD WINAPI GetDataThreadProc(PVOID pParam)//获取温度占用硬盘线程
 			}
 			if (tipsActive)
 			{
+				CollectTipsPageFileUsage();
 				int memoryLimit = settings.bTipsMemory ? (int)settings.TipsMemoryRows : 0;
 				int cpuLimit = settings.bTipsCPU ? (int)settings.TipsCPURows : 0;
 				if (memoryLimit > 0 || cpuLimit > 0)
@@ -3257,7 +3430,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 {
 	const COLORREF color = RGB(0, 192, 192);
 	const int columns[] = { 40, 55, 70, 85, 100 };
-	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"总内存", L"虚拟内存" };
+	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"物理内存", L"总内存" };
 	SetTextColor(dc, color);
 	RECT name = row;
 	name.left = 5;
@@ -3272,7 +3445,8 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 			values[0] = item->privateWorkingSet;
 			values[1] = item->sharedWorkingSet;
 			values[2] = item->totalWorkingSet;
-			values[3] = item->privateCommit;
+			// Requested estimate: private commit plus the resident shared working set.
+			values[3] = item->privateCommit + item->sharedWorkingSet;
 		}
 		for (int i = 0; i < ARRAYSIZE(values); ++i)
 		{
@@ -3332,7 +3506,26 @@ void DrawTipsTrafficRow(HDC dc, RECT row, const RECT& client, const TRAFFIC& ite
 	DrawText(dc, text, lstrlen(text), &row, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
 
-void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, const MEMORYSTATUSEX& status)
+static void FormatTipsUsage(WCHAR* text, const WCHAR* label, ULONGLONG used, ULONGLONG total)
+{
+	const ULONGLONG unit = 1073741824;
+	wsprintf(text, L"%s%I64u.%.2u/%I64u.%.2uGB", label,
+		used / unit, (DWORD)((used % unit) * 100 / unit),
+		total / unit, (DWORD)((total % unit) * 100 / unit));
+}
+
+static void FillTipsUsage(HDC dc, const RECT& cell, ULONGLONG used, ULONGLONG total,
+	HBRUSH emptyBrush, HBRUSH usedBrush)
+{
+	if (emptyBrush) FillRect(dc, &cell, emptyBrush);
+	if (!total || !usedBrush) return;
+	if (used > total) used = total;
+	RECT fill = cell;
+	fill.right = fill.left + (LONG)((double)used / (double)total * (cell.right - cell.left));
+	FillRect(dc, &fill, usedBrush);
+}
+
+void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, const MEMORYSTATUSEX& status, const PAGEFILE_USAGE& pageFiles)
 {
 	RECT drives = { client.right * 8 / 100 + 3, top + 3, client.right * 92 / 100 - 2, top + rowHeight - 1 };
 	HBRUSH emptyBrush = CreateSolidBrush(RGB(168, 168, 168));
@@ -3354,17 +3547,19 @@ void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, cons
 			LPWSTR name = driveStrings + index * 4;
 			if (!name[0])
 				break;
-			RECT fill = cell;
+			WCHAR label[8], text[96];
+			wsprintf(label, L"%c: ", name[0]);
 			UINT64 available = 0, total = 0, freeBytes = 0;
 			if (GetDriveType(name) != DRIVE_CDROM && name[0] != L'A' &&
 				GetDiskFreeSpaceEx(name, (PULARGE_INTEGER)&available, (PULARGE_INTEGER)&total, (PULARGE_INTEGER)&freeBytes) && total)
 			{
-				FillRect(dc, &cell, emptyBrush);
-				fill.right = fill.left + (LONG)((LONGLONG)(cell.right - cell.left) * (total - freeBytes) / total);
-				FillRect(dc, &fill, freeBytes < total / 10 ? warningBrush : diskBrush);
+				if (freeBytes > total) freeBytes = total;
+				FillTipsUsage(dc, cell, total - freeBytes, total, emptyBrush, freeBytes < total / 10 ? warningBrush : diskBrush);
+				FormatTipsUsage(text, label, total - freeBytes, total);
 			}
-			name[2] = 0;
-			DrawText(dc, name, lstrlen(name), &cell, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+			else
+				wsprintf(text, L"%s不可用", label);
+			DrawText(dc, text, lstrlen(text), &cell, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 			OffsetRect(&cell, width + 2, 0);
 			if (cell.right - 3 > client.right * 92 / 100)
 				break;
@@ -3374,28 +3569,20 @@ void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, cons
 	DrawText(dc, L"设置", 2, &setting, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 	RECT exitButton = { client.right * 92 / 100, top, client.right, top + rowHeight };
 	DrawText(dc, L"退出", 2, &exitButton, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	DWORDLONG availablePage = status.ullAvailPageFile * 100 / 1073741824;
-	DWORDLONG totalPage = status.ullTotalPageFile * 100 / 1073741824;
-	DWORDLONG availablePhys = status.ullAvailPhys * 100 / 1073741824;
-	DWORDLONG totalPhys = status.ullTotalPhys * 100 / 1073741824;
-	if (!totalPage) totalPage = 1;
-	if (!totalPhys) totalPhys = 1;
-	if (availablePage > totalPage) availablePage = totalPage;
-	if (availablePhys > totalPhys) availablePhys = totalPhys;
+	ULONGLONG usedPhys = status.ullTotalPhys >= status.ullAvailPhys ? status.ullTotalPhys - status.ullAvailPhys : 0;
 	RECT page = { client.right * 8 / 100 + 3, top + rowHeight + 3, client.right * 50 / 100 - 1, top + rowHeight * 2 - 1 };
 	RECT phys = { client.right * 50 / 100 + 1, page.top, client.right * 92 / 100 - 2, page.bottom };
-	RECT fill = page;
-	if (emptyBrush) FillRect(dc, &page, emptyBrush);
-	fill.right = fill.left + (LONG)((LONGLONG)(page.right - page.left) * (totalPage - availablePage) / totalPage);
-	if (warningBrush && memoryBrush) FillRect(dc, &fill, availablePage < totalPage * 2 / 10 ? warningBrush : memoryBrush);
-	if (emptyBrush) FillRect(dc, &phys, emptyBrush);
-	fill = phys;
-	fill.right = fill.left + (LONG)((LONGLONG)(phys.right - phys.left) * (totalPhys - availablePhys) / totalPhys);
-	if (warningBrush && memoryBrush) FillRect(dc, &fill, availablePhys < totalPhys * 2 / 10 ? warningBrush : memoryBrush);
-	WCHAR text[64];
-	wsprintf(text, L"虚拟内存:%I64u.%.2I64u/%I64u.%.2I64uGB", availablePage / 100, availablePage % 100, totalPage / 100, totalPage % 100);
+	FillTipsUsage(dc, page, pageFiles.usedBytes, pageFiles.totalBytes, emptyBrush,
+		pageFiles.totalBytes && pageFiles.usedBytes > pageFiles.totalBytes - pageFiles.totalBytes / 5 ? warningBrush : memoryBrush);
+	FillTipsUsage(dc, phys, usedPhys, status.ullTotalPhys, emptyBrush,
+		status.ullTotalPhys && usedPhys > status.ullTotalPhys - status.ullTotalPhys / 5 ? warningBrush : memoryBrush);
+	WCHAR text[96];
+	if (pageFiles.valid)
+		FormatTipsUsage(text, L"虚拟内存：", pageFiles.usedBytes, pageFiles.totalBytes);
+	else
+		lstrcpy(text, L"虚拟内存：不可用");
 	DrawText(dc, text, lstrlen(text), &page, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-	wsprintf(text, L"物理内存:%I64u.%.2I64u/%I64u.%.2I64uGB", availablePhys / 100, availablePhys % 100, totalPhys / 100, totalPhys % 100);
+	FormatTipsUsage(text, L"物理内存：", usedPhys, status.ullTotalPhys);
 	DrawText(dc, text, lstrlen(text), &phys, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 	if (emptyBrush) DeleteObject(emptyBrush);
 	if (warningBrush) DeleteObject(warningBrush);
@@ -3403,9 +3590,18 @@ void DrawTipsBottomRows(HDC dc, const RECT& client, int top, int rowHeight, cons
 	if (memoryBrush) DeleteObject(memoryBrush);
 }
 
+static int GetTipsVisibleRows(const RECT& client, int rowHeight)
+{
+	if (rowHeight < 1) return 0;
+	int rows = (client.bottom - 2 * rowHeight) / rowHeight;
+	if (rows < 0) rows = 0;
+	if (rows > MAX_TIPS_VISIBLE_ROWS) rows = MAX_TIPS_VISIBLE_ROWS;
+	return rows;
+}
+
 BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int trafficRows,
 	const PROCESSCPUUSAGE* cpuProcesses, int cpuRows, const PROCESSMEMORYUSAGE* memoryProcesses,
-	int memoryRows, const MEMORYSTATUSEX& memoryStatus, const TRAYSAVE& settings, int scrollOffset)
+	int memoryRows, const MEMORYSTATUSEX& memoryStatus, const PAGEFILE_USAGE& pageFiles, const TRAYSAVE& settings, int scrollOffset)
 {
 	RECT client;
 	GetClientRect(window, &client);
@@ -3430,7 +3626,7 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 	ScreenToClient(window, &cursor);
 	int memoryHeaderRows = memoryRows > 0 ? 1 : 0;
 	int totalRows = trafficRows + cpuRows + memoryHeaderRows + memoryRows;
-	int visibleRows = (int)settings.TipsVisibleRows;
+	int visibleRows = GetTipsVisibleRows(client, wTipsHeight);
 	HBRUSH alternate = CreateSolidBrush(RGB(24, 24, 24));
 	HPEN divider = CreatePen(PS_DOT, 1, RGB(98, 98, 98));
 	HPEN oldPen = divider ? (HPEN)SelectObject(buffer, divider) : NULL;
@@ -3503,14 +3699,15 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 		}
 	}
 	SetTextColor(buffer, RGB(255, 255, 255));
-	int bottomTop = visibleRows * wTipsHeight;
+	int bottomTop = client.bottom - wTipsHeight * 2;
+	if (bottomTop < 0) bottomTop = 0;
 	MoveToEx(buffer, 0, bottomTop, NULL);
 	LineTo(buffer, client.right, bottomTop);
 	MoveToEx(buffer, client.right * 8 / 100, bottomTop, NULL);
 	LineTo(buffer, client.right * 8 / 100, bottomTop + wTipsHeight * 2);
 	MoveToEx(buffer, client.right * 92 / 100, bottomTop, NULL);
 	LineTo(buffer, client.right * 92 / 100, bottomTop + wTipsHeight * 2);
-	DrawTipsBottomRows(buffer, client, bottomTop, wTipsHeight, memoryStatus);
+	DrawTipsBottomRows(buffer, client, bottomTop, wTipsHeight, memoryStatus, pageFiles);
 	BitBlt(target, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
 	if (oldPen) SelectObject(buffer, oldPen);
 	if (divider) DeleteObject(divider);
@@ -3546,6 +3743,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	static PROCESSMEMORYUSAGE memoryProcesses[MAX_TIPS_PROCESS_ROWS] = { 0 };
 	static PROCESSCPUUSAGE cpuProcesses[MAX_TIPS_PROCESS_ROWS] = { 0 };
 	static MEMORYSTATUSEX memoryStatus = { 0 };
+	static PAGEFILE_USAGE pageFiles = { 0 };
 	static TRAYSAVE displaySettings = { 0 };
 	static int trafficCount = 0;
 	static int scrollOffset = 0;
@@ -3562,6 +3760,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 				memoryProcesses,
 				cpuProcesses,
 				&memoryStatus,
+				&pageFiles,
 				&displaySettings);
 			displayPaused = pauseRequested;
 			InvalidateRect(hDlg, NULL, TRUE);
@@ -3576,6 +3775,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			memoryProcesses,
 			cpuProcesses,
 			&memoryStatus,
+			&pageFiles,
 			&displaySettings);
 	}
 	int trafficRows = displaySettings.bTipsTraffic ? trafficCount : 0;
@@ -3583,15 +3783,18 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		trafficRows = (int)displaySettings.TipsTrafficRows;
 	int cpuRows = displaySettings.bTipsCPU ? (int)displaySettings.TipsCPURows : 0;
 	int memoryRows = displaySettings.bTipsMemory ? (int)displaySettings.TipsMemoryRows : 0;
-	int visibleRows = (int)displaySettings.TipsVisibleRows;
+	RECT tipsClient;
+	GetClientRect(hDlg, &tipsClient);
+	int visibleRows = GetTipsVisibleRows(tipsClient, wTipsHeight);
+	int bottomTop = tipsClient.bottom - wTipsHeight * 2;
+	if (bottomTop < 0) bottomTop = 0;
 	if (trafficRows < 0)
 		trafficRows = 0;
 	if (cpuRows < 0 || cpuRows > MAX_TIPS_PROCESS_ROWS)
 		cpuRows = 0;
 	if (memoryRows < 0 || memoryRows > MAX_TIPS_PROCESS_ROWS)
 		memoryRows = 0;
-	if (visibleRows < 4 || visibleRows > 30)
-		visibleRows = 13;
+
 	int memoryHeaderRows = memoryRows > 0 ? 1 : 0;
 	int totalRows = trafficRows + cpuRows + memoryHeaderRows + memoryRows;
 	int maxScroll = totalRows > visibleRows ? totalRows - visibleRows : 0;
@@ -3744,6 +3947,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		}
 		else
 		{
+			if (pt.y < bottomTop) return TRUE;
 			RECT rc;
 			GetClientRect(hDlg, &rc);
 			if (pt.x < rc.right * 8 / 100)
@@ -3757,7 +3961,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			}
 			else
 			{
-				if (pt.y < (visibleRows + 1) * wTipsHeight)
+				if (pt.y < bottomTop + wTipsHeight)
 				{
 					WCHAR wDrive[MAX_PATH];
 					DWORD dwLen = GetLogicalDriveStrings(MAX_PATH, wDrive);
@@ -3801,6 +4005,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			memoryProcesses,
 			memoryRows,
 			memoryStatus,
+			pageFiles,
 			displaySettings,
 			scrollOffset);
 	}
@@ -3997,7 +4202,7 @@ static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, UL
 	int insertAt = -1;
 	for (int i = 0; i < limit; ++i)
 	{
-		if (totalBytes >= ppmuWork[i]->totalWorkingSet)
+		if (privateCommit + sharedBytes >= ppmuWork[i]->privateCommit + ppmuWork[i]->sharedWorkingSet)
 		{
 			insertAt = i;
 			break;
@@ -4566,45 +4771,18 @@ INT_PTR CALLBACK TaskBarProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 				}
 				SetLayeredWindowAttributes(hTaskTips, 0, 255, LWA_ALPHA);
 			}
-				HDC mdc = GetDC(hMain);
-			TraySave.TipsFont.lfHeight = DPI(TraySave.TipsFontSize);
-			HFONT hTipsFont = CreateFontIndirect(&TraySave.TipsFont); //创建字体
-			HFONT oldFont = (HFONT)SelectObject(mdc, hTipsFont);
-			SIZE tSize;
-			::GetTextExtentPoint(mdc, L"虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存虚拟内存", 36, &tSize);
-			if (TraySave.bTipsMemory)
-			{
-				// Keep group names and all four numeric columns readable with the chosen font.
-				SIZE textSize = { 0 };
-				const WCHAR sampleName[] = L"svchost.exe (netsvcs-p)";
-				GetTextExtentPoint(mdc, sampleName, ARRAYSIZE(sampleName) - 1, &textSize);
-				int minimumWidth = (textSize.cx + 8) * 100 / 36 + 1;
-				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
-				GetTextExtentPoint(mdc, L"9999.99GB", 9, &textSize);
-				minimumWidth = (textSize.cx + 6) * 100 / 15 + 1;
-				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
-				GetTextExtentPoint(mdc, L"专用内存", 4, &textSize);
-				minimumWidth = (textSize.cx + 6) * 100 / 15 + 1;
-				if (tSize.cx < minimumWidth) tSize.cx = minimumWidth;
-			}
-			SelectObject(mdc, oldFont);
-			DeleteObject(hTipsFont);
-			::ReleaseDC(hMain, mdc);
-			int x, y, w, h;
-			w = tSize.cx;
-			wTipsHeight = tSize.cy;
-			DWORD visibleRows = TraySave.TipsVisibleRows;
-			if (visibleRows < 4 || visibleRows > 30)
-				visibleRows = 13;
-			h = wTipsHeight * (visibleRows + 2);
-			w += GetSystemMetrics(SM_CXVSCROLL);
+			SIZE size = MeasureTipsWindow(TraySave, &wTipsHeight);
+			int x, y, w = size.cx, h = size.cy;
 			RECT wrc, src;
 			GetWindowRect(hDlg, &wrc);
 			GetScreenRect(hDlg, &src, TRUE);
+			if (w > src.right - src.left) w = src.right - src.left;
+			if (h > src.bottom - src.top) h = src.bottom - src.top;
 			if (wrc.bottom + h > src.bottom)
 				y = wrc.top - h;
 			else
 				y = wrc.bottom;
+			if (y < src.top) y = src.top;
 			if (wrc.right - (wrc.right - wrc.left) / 2 + w / 2 > src.right)
 				x = src.right - w;
 			else if (wrc.right - (wrc.right - wrc.left) / 2 - w / 2 < src.left)

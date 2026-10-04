@@ -118,6 +118,8 @@
 #define IDC_TIPS_CHOOSE_FONT            1117
 #define IDC_TIPS_SAVE                   1118
 #define IDC_TIPS_CANCEL                 1119
+#define IDC_TIPS_WIDTH                  1120
+#define IDC_TIPS_HEIGHT                 1121
 #define ID_32800                        32800
 #define IDC_SELECT_ALL                  33000
 #define IDC_DISK_ALL                    33200
@@ -130,7 +132,7 @@
 #define _APS_NO_MFC                     1
 #define _APS_NEXT_RESOURCE_VALUE        144
 #define _APS_NEXT_COMMAND_VALUE         32802
-#define _APS_NEXT_CONTROL_VALUE         1120
+#define _APS_NEXT_CONTROL_VALUE         1122
 #define _APS_NEXT_SYMED_VALUE           110
 #endif
 #endif

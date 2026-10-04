@@ -77,6 +77,7 @@ void AddItem(LPWINDOW_INFO lpWindowInfo)
 #define MAX_TRAFFIC_ADAPTERS 128
 #define MAX_TIPS_TRAFFIC_ROWS 64
 #define MAX_TIPS_PROCESS_ROWS 64
+#define MAX_TIPS_VISIBLE_ROWS (MAX_TIPS_TRAFFIC_ROWS + MAX_TIPS_PROCESS_ROWS * 2 + 1)
 typedef struct _TRAFFIC
 {
 	ULONG64 in_bytes;
@@ -257,9 +258,11 @@ typedef struct _TRAYSAVE//默认参数
 	DWORD TipsCPURows;//CPU进程列表行数
 	DWORD TipsMemoryRows;//内存进程列表行数
 	DWORD TipsVisibleRows;//提示窗口上方可见行数
+	DWORD TipsWidth;//提示窗口宽度（像素），0 使用原自动尺寸
+	DWORD TipsHeight;//提示窗口高度（像素），0 使用原自动尺寸
 }TRAYSAVE;
 TRAYSAVE TraySave = {
-	118,
+	119,
 	{ ACCENT_ENABLE_TRANSPARENTGRADIENT,ACCENT_ENABLE_BLURBEHIND } ,
 	{ 0x00111111,0x66000000 },{ 255,255 } ,
 	{ 10 * 1024 * 1024,64 * 1024 * 1024,66,96,81,96,61,88,98 * 1048576,88,0,0 } ,
@@ -315,7 +318,9 @@ TRAYSAVE TraySave = {
 	6,
 	6,
 	6,
-	13
+	13,
+	0,
+	0
 };
 TRAYSAVE MonitorSettings = { 0 };//仅由 UI 线程发布，工作线程读取的配置快照
 int wTraffic;//流量宽度
@@ -336,6 +341,14 @@ int iWindowMode=FALSE;
 //BOOL bAccentNormal = FALSE;
 MEMORYSTATUSEX MemoryStatusEx;/////////////////虚拟内存/内存大小
 MEMORYSTATUSEX MemoryStatusSnapshot;
+struct PAGEFILE_USAGE
+{
+	ULONGLONG usedBytes;
+	ULONGLONG totalBytes;
+	BOOL valid;
+};
+PAGEFILE_USAGE PageFileUsage = { 0 };
+PAGEFILE_USAGE PageFileUsageSnapshot = { 0 };
 DWORD CpuUsageSnapshot = 0;
 BOOL bTaskBarMoveing = FALSE;///////////////////窗口是否正在移动中
 PROCESSMEMORYUSAGE pmu[MAX_TIPS_PROCESS_ROWS];
