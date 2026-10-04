@@ -1267,20 +1267,21 @@ void lstrlwr(WCHAR* wString, size_t SizeInWords)
 
 BOOL OpenProcessPath(DWORD dwProcessId)//通过进程ID打开进程的路径
 {
-	BOOL ret = FALSE;
-	WCHAR szExplorer[MAX_PATH] = L"/select,";
-	WCHAR* sz;
-	int iLen = lstrlen(szExplorer);
-	sz = &szExplorer[iLen];
-	if (GetProcessFileName(dwProcessId, sz, MAX_PATH))
-	{
-		WCHAR szExe[MAX_PATH];
-		GetWindowsDirectory(szExe, MAX_PATH);
-		lstrcat(szExe, L"\\explorer.exe ");
-		lstrcat(szExe, szExplorer);
-		ret = RunProcess((LPTSTR)1, szExe);
-	}
-	return ret;
+	WCHAR fileName[MAX_PATH] = { 0 };
+	if (!GetProcessFileName(dwProcessId, fileName, ARRAYSIZE(fileName)))
+		return FALSE;
+	fileName[ARRAYSIZE(fileName) - 1] = 0;
+	if (!fileName[0] || lstrlen(fileName) >= ARRAYSIZE(fileName) - 1)
+		return FALSE;
+	WCHAR explorer[MAX_PATH];
+	const WCHAR suffix[] = L"\\explorer.exe";
+	UINT length = GetWindowsDirectory(explorer, ARRAYSIZE(explorer));
+	if (!length || length > ARRAYSIZE(explorer) - ARRAYSIZE(suffix))
+		return FALSE;
+	lstrcat(explorer, suffix);
+	WCHAR parameters[MAX_PATH + 16];
+	wsprintf(parameters, L"/select,\"%s\"", fileName);
+	return (INT_PTR)pShellExecute(NULL, L"open", explorer, parameters, NULL, SW_SHOWNORMAL) > 32;
 }
 BOOL OpenWindowPath(HWND hWnd)//////////////通过窗口打开进程的路径
 {

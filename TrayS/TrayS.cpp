@@ -3430,7 +3430,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 {
 	const COLORREF color = RGB(0, 192, 192);
 	const int columns[] = { 40, 55, 70, 85, 100 };
-	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"物理内存", L"总内存" };
+	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"物理内存", L"私有提交" };
 	SetTextColor(dc, color);
 	RECT name = row;
 	name.left = 5;
@@ -3445,8 +3445,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 			values[0] = item->privateWorkingSet;
 			values[1] = item->sharedWorkingSet;
 			values[2] = item->totalWorkingSet;
-			// Requested estimate: private commit plus the resident shared working set.
-			values[3] = item->privateCommit + item->sharedWorkingSet;
+			values[3] = item->privateCommit;
 		}
 		for (int i = 0; i < ARRAYSIZE(values); ++i)
 		{
@@ -3912,14 +3911,21 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			BOOL memoryRow = processRow >= cpuRows + memoryHeaderRows;
 			RECT client;
 			GetClientRect(hDlg, &client);
+			DWORD pid = memoryRow ? memoryProcesses[processRow - cpuRows - memoryHeaderRows].dwProcessID
+				: cpuProcesses[processRow].dwProcessID;
+			if (pid == 0)
+				return TRUE;
+			RECT name = client;
+			name.right = memoryRow ? client.right * 36 / 100 : client.right * 100 / 178;
+			if (PtInRect(&name, pt))
+			{
+				OpenProcessPath(pid);
+				return TRUE;
+			}
 			RECT path, terminate;
 			GetTipsProcessActionRects(client, client, memoryRow, &path, &terminate);
 			if (PtInRect(&path, pt) || PtInRect(&terminate, pt))
 			{
-				DWORD pid = memoryRow ? memoryProcesses[processRow - cpuRows - memoryHeaderRows].dwProcessID
-					: cpuProcesses[processRow].dwProcessID;
-				if (pid == 0)
-					return TRUE;
 				if (PtInRect(&terminate, pt))
 				{
 					HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
@@ -4202,7 +4208,7 @@ static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, UL
 	int insertAt = -1;
 	for (int i = 0; i < limit; ++i)
 	{
-		if (privateCommit + sharedBytes >= ppmuWork[i]->privateCommit + ppmuWork[i]->sharedWorkingSet)
+		if (privateCommit >= ppmuWork[i]->privateCommit)
 		{
 			insertAt = i;
 			break;
