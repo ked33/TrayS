@@ -342,6 +342,7 @@ typedef struct _TIPS_PROCESS_ACCUM
 	DWORD cpuPid;
 	ULONGLONG privateWorkingSet;
 	ULONGLONG sharedWorkingSet;
+	ULONGLONG privateCommit;
 	SIZE_T memoryPidUsage;
 	float fCpuUsage;
 	float cpuPidUsage;
@@ -3213,10 +3214,19 @@ static void GetTipsProcessActionRects(const RECT& row, const RECT& client, BOOL 
 {
 	*path = row;
 	*terminate = row;
-	path->left = memoryRow ? client.right * 32 / 100 : client.right * 100 / 178;
-	path->right = memoryRow ? client.right * 39 / 100 : client.right * 100 / 156;
-	terminate->left = path->right;
-	terminate->right = memoryRow ? client.right * 43 / 100 : client.right * 100 / 145;
+	if (memoryRow)
+	{
+		SetRectEmpty(path);
+		terminate->left = client.right * 28 / 100;
+		terminate->right = client.right * 32 / 100;
+	}
+	else
+	{
+		path->left = client.right * 100 / 178;
+		path->right = client.right * 100 / 156;
+		terminate->left = path->right;
+		terminate->right = client.right * 100 / 145;
+	}
 }
 
 void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD pid, POINT cursor, COLORREF color, BOOL memoryRow)
@@ -3236,37 +3246,41 @@ void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD p
 	GetTipsProcessActionRects(row, client, memoryRow, &path, &terminate);
 	SetTextColor(dc, PtInRect(&terminate, cursor) ? RGB(255, 255, 255) : color);
 	DrawText(dc, L"X", 1, &terminate, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	SetTextColor(dc, PtInRect(&path, cursor) ? RGB(255, 255, 255) : color);
-	DrawText(dc, L"路径", 2, &path, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	if (!memoryRow)
+	{
+		SetTextColor(dc, PtInRect(&path, cursor) ? RGB(255, 255, 255) : color);
+		DrawText(dc, L"路径", 2, &path, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	}
 }
 
 static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const PROCESSMEMORYUSAGE* item, POINT cursor)
 {
 	const COLORREF color = RGB(0, 192, 192);
-	const int columns[] = { 43, 62, 81, 100 };
-	const WCHAR* titles[] = { L"专用工作集", L"共享工作集", L"总工作集" };
+	const int columns[] = { 32, 49, 66, 83, 100 };
+	const WCHAR* titles[] = { L"专用内存", L"共享内存", L"总内存", L"虚拟内存" };
 	SetTextColor(dc, color);
 	RECT name = row;
 	name.left = 5;
-	name.right = client.right * 32 / 100 - 3;
+	name.right = client.right * 28 / 100 - 3;
 	if (!item || item->dwProcessID)
 	{
 		const WCHAR* text = item ? item->szExe : L"进程";
 		DrawText(dc, text, lstrlen(text), &name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-		ULONGLONG values[3] = { 0, 0, 0 };
+		ULONGLONG values[4] = { 0, 0, 0, 0 };
 		if (item)
 		{
 			values[0] = item->privateWorkingSet;
 			values[1] = item->sharedWorkingSet;
 			values[2] = item->totalWorkingSet;
+			values[3] = item->privateCommit;
 		}
-		for (int i = 0; i < 3; ++i)
+		for (int i = 0; i < ARRAYSIZE(values); ++i)
 		{
 			RECT cell = row;
 			cell.left = client.right * columns[i] / 100 + 3;
 			cell.right = client.right * columns[i + 1] / 100 - 3;
 			if (!item)
-				DrawText(dc, titles[i], lstrlen(titles[i]), &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+				DrawText(dc, titles[i], lstrlen(titles[i]), &cell, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 			else
 			{
 				WCHAR text[32];
@@ -3281,7 +3295,7 @@ static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const
 		if (item)
 			DrawTipsProcessActions(dc, row, client, item->dwProcessID, cursor, color, TRUE);
 	}
-	const int dividers[] = { 32, 39, 43, 62, 81 };
+	const int dividers[] = { 28, 32, 49, 66, 83 };
 	for (int i = 0; i < ARRAYSIZE(dividers); ++i)
 	{
 		int x = client.right * dividers[i] / 100;
@@ -3581,13 +3595,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 	int maxScroll = totalRows > visibleRows ? totalRows - visibleRows : 0;
 	if (scrollOffset > maxScroll)
 		scrollOffset = maxScroll;
-	SCROLLINFO scrollInfo = { sizeof(scrollInfo), SIF_RANGE | SIF_PAGE | SIF_POS };
-	scrollInfo.nMin = 0;
-	scrollInfo.nMax = totalRows > 0 ? totalRows - 1 : 0;
-	scrollInfo.nPage = visibleRows;
-	scrollInfo.nPos = scrollOffset;
-	SetScrollInfo(hDlg, SB_VERT, &scrollInfo, TRUE);
-	ShowScrollBar(hDlg, SB_VERT, totalRows > visibleRows);
+	// Keep scrolling in scrollOffset; native scrollbar state can make the hidden bar reappear.
 	switch (message)
 	{
 	case WM_INITDIALOG:
@@ -3595,11 +3603,7 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		scrollOffset = 0;
 		wheelRemainder = 0;
 		SetTimer(hDlg, TASK_TIPS_PAUSE_TIMER_ID, TASK_TIPS_PAUSE_POLL_INTERVAL_MS, NULL);
-		SetWindowLongPtr(hDlg, GWL_STYLE, GetWindowLongPtr(hDlg, GWL_STYLE) | WS_VSCROLL);
-		SetWindowPos(hDlg, NULL, 0, 0, 0, 0,
-			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-		SetScrollInfo(hDlg, SB_VERT, &scrollInfo, TRUE);
-		ShowScrollBar(hDlg, SB_VERT, totalRows > visibleRows);
+		ShowScrollBar(hDlg, SB_VERT, FALSE);
 		InterlockedExchange(&bTaskTipsActive, TRUE);
 		return (INT_PTR)TRUE;
 	case WM_DESTROY:
@@ -3648,7 +3652,6 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		if (next != scrollOffset)
 		{
 			scrollOffset = next;
-			SetScrollPos(hDlg, SB_VERT, scrollOffset, TRUE);
 			InvalidateRect(hDlg, NULL, TRUE);
 		}
 		return TRUE;
@@ -3666,12 +3669,9 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		case SB_BOTTOM: next = maxScroll; break;
 		case SB_THUMBTRACK:
 		case SB_THUMBPOSITION:
-		{
-			SCROLLINFO trackInfo = { sizeof(trackInfo), SIF_TRACKPOS };
-			GetScrollInfo(hDlg, SB_VERT, &trackInfo);
-			next = trackInfo.nTrackPos;
+			// The configured row range fits in the message's 16-bit position.
+			next = HIWORD(wParam);
 			break;
-		}
 		}
 		if (next < 0)
 			next = 0;
@@ -3680,7 +3680,6 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		if (next != scrollOffset)
 		{
 			scrollOffset = next;
-			SetScrollPos(hDlg, SB_VERT, scrollOffset, TRUE);
 			InvalidateRect(hDlg, NULL, TRUE);
 		}
 		return TRUE;
@@ -3823,24 +3822,34 @@ static BOOL EnsureTipsMemoryApi()
 	return pTipsGetProcessMemoryInfo != NULL;
 }
 
-static BOOL QueryTipsWorkingSet(DWORD pid, HANDLE process, SIZE_T* privateBytes, SIZE_T* sharedBytes)
+static BOOL QueryTipsMemoryUsage(DWORD pid, HANDLE process, SIZE_T* privateBytes, SIZE_T* sharedBytes, SIZE_T* privateCommit)
 {
-	if (!process || !privateBytes || !sharedBytes)
+	if (!process || !privateBytes || !sharedBytes || !privateCommit || !EnsureTipsMemoryApi())
 		return FALSE;
-	if (EnsureTipsMemoryApi())
+	TIPS_MEMORY_COUNTERS_EX2 counters;
+	ZeroMemory(&counters, sizeof(counters));
+	counters.base.cb = sizeof(counters);
+	// Older systems may accept the buffer without writing the EX2 extension.
+	counters.PrivateWorkingSetSize = (SIZE_T)-1;
+	if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)))
 	{
-		TIPS_MEMORY_COUNTERS_EX2 counters;
-		ZeroMemory(&counters, sizeof(counters));
-		counters.base.cb = sizeof(counters);
-		// Older systems may accept the buffer without writing the EX2 extension.
-		counters.PrivateWorkingSetSize = (SIZE_T)-1;
-		if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)) &&
-			counters.PrivateWorkingSetSize <= counters.base.WorkingSetSize)
+		// "Virtual memory" is private commit, not bytes stored in the pagefile.
+		*privateCommit = counters.base.PrivateUsage;
+		if (counters.PrivateWorkingSetSize <= counters.base.WorkingSetSize)
 		{
 			*privateBytes = counters.PrivateWorkingSetSize;
 			*sharedBytes = counters.base.WorkingSetSize - counters.PrivateWorkingSetSize;
 			return TRUE;
 		}
+	}
+	else
+	{
+		PROCESS_MEMORY_COUNTERS_EX basic;
+		ZeroMemory(&basic, sizeof(basic));
+		basic.cb = sizeof(basic);
+		if (!pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&basic, sizeof(basic)))
+			return FALSE;
+		*privateCommit = basic.PrivateUsage;
 	}
 	if (!pTipsQueryWorkingSet)
 	{
@@ -3974,10 +3983,10 @@ static TIPS_PROCESS_ACCUM* AddOrGetTipsAccum(const WCHAR* exe, int* count)
 	return item;
 }
 
-static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, ULONGLONG sharedBytes, const WCHAR* exe)
+static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, ULONGLONG sharedBytes, ULONGLONG privateCommit, const WCHAR* exe)
 {
 	ULONGLONG totalBytes = privateBytes + sharedBytes;
-	if (limit < 1 || totalBytes == 0 || !exe)
+	if (limit < 1 || (totalBytes == 0 && privateCommit == 0) || !exe)
 		return;
 	int insertAt = -1;
 	for (int i = 0; i < limit; ++i)
@@ -3998,6 +4007,7 @@ static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, UL
 	recycled->privateWorkingSet = privateBytes;
 	recycled->sharedWorkingSet = sharedBytes;
 	recycled->totalWorkingSet = totalBytes;
+	recycled->privateCommit = privateCommit;
 	lstrcpyn(recycled->szExe, exe, ARRAYSIZE(recycled->szExe));
 }
 
@@ -4077,10 +4087,10 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 			HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 			if (processHandle)
 			{
-				SIZE_T privateBytes = 0, sharedBytes = 0;
+				SIZE_T privateBytes = 0, sharedBytes = 0, privateCommit = 0;
 				BOOL haveMemory = FALSE;
 				if (memoryLimit > 0)
-					haveMemory = QueryTipsWorkingSet(pid, processHandle, &privateBytes, &sharedBytes);
+					haveMemory = QueryTipsMemoryUsage(pid, processHandle, &privateBytes, &sharedBytes, &privateCommit);
 				float usage = 0;
 				BOOL haveCpu = FALSE;
 				if (cpuLimit > 0 && pid != currentProcessId)
@@ -4116,16 +4126,17 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 						pProcessTime[timeIndex].dwSeenCycle = sampleCycle;
 					}
 				}
-				if ((haveMemory && (privateBytes > 0 || sharedBytes > 0)) || (haveCpu && usage > 0))
+				if ((haveMemory && (privateBytes > 0 || sharedBytes > 0 || privateCommit > 0)) || (haveCpu && usage > 0))
 				{
 					TIPS_PROCESS_ACCUM* item = AddOrGetTipsAccum(process.szExeFile, &accumCount);
 					if (item)
 					{
-						if (haveMemory && (privateBytes > 0 || sharedBytes > 0))
+						if (haveMemory && (privateBytes > 0 || sharedBytes > 0 || privateCommit > 0))
 						{
 							// Same-name processes remain grouped; shared pages may repeat across them.
 							item->privateWorkingSet += privateBytes;
 							item->sharedWorkingSet += sharedBytes;
+							item->privateCommit += privateCommit;
 							SIZE_T totalBytes = privateBytes + sharedBytes;
 							if (totalBytes >= item->memoryPidUsage)
 							{
@@ -4163,7 +4174,7 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 	for (int i = 0; i < accumCount; ++i)
 	{
 		const TIPS_PROCESS_ACCUM* item = &pTipsProcessAccum[i];
-		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->privateWorkingSet, item->sharedWorkingSet, item->szExe);
+		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->privateWorkingSet, item->sharedWorkingSet, item->privateCommit, item->szExe);
 		InsertTipsCpuRow(cpuLimit, item->cpuPid, item->fCpuUsage, item->szExe);
 	}
 	return cpuLimit < 1 ? TRUE : hadCpuDelta;

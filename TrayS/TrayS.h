@@ -95,6 +95,7 @@ typedef struct _PROCESSMEMORYUSAGE
 	ULONGLONG privateWorkingSet;
 	ULONGLONG sharedWorkingSet;
 	ULONGLONG totalWorkingSet;
+	ULONGLONG privateCommit;
 }PROCESSMEMORYUSAGE;
 ///////////////////////////////////////////进程的CPU使用率数据结构
 typedef struct _PROCESSCPUUSAGE
