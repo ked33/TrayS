@@ -92,7 +92,9 @@ typedef struct _PROCESSMEMORYUSAGE
 {
 	WCHAR szExe[37];
 	DWORD dwProcessID;	
-	SIZE_T dwMemUsage;
+	ULONGLONG privateWorkingSet;
+	ULONGLONG sharedWorkingSet;
+	ULONGLONG totalWorkingSet;
 }PROCESSMEMORYUSAGE;
 ///////////////////////////////////////////进程的CPU使用率数据结构
 typedef struct _PROCESSCPUUSAGE

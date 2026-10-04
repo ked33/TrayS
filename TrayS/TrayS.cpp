@@ -340,7 +340,8 @@ typedef struct _TIPS_PROCESS_ACCUM
 	WCHAR szExe[37];
 	DWORD memoryPid;
 	DWORD cpuPid;
-	SIZE_T dwMemUsage;
+	ULONGLONG privateWorkingSet;
+	ULONGLONG sharedWorkingSet;
 	SIZE_T memoryPidUsage;
 	float fCpuUsage;
 	float cpuPidUsage;
@@ -351,6 +352,20 @@ static int nTipsProcessAccumCapacity = 0;
 static HMODULE hTipsPsapiModule = NULL;
 typedef BOOL(WINAPI* pfnTipsGetProcessMemoryInfo)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
 static pfnTipsGetProcessMemoryInfo pTipsGetProcessMemoryInfo = NULL;
+typedef BOOL(WINAPI* pfnTipsQueryWorkingSet)(HANDLE, PVOID, DWORD);
+static pfnTipsQueryWorkingSet pTipsQueryWorkingSet = NULL;
+static PSAPI_WORKING_SET_INFORMATION* pTipsWorkingSet = NULL;
+static DWORD cbTipsWorkingSet = 0;
+
+// PROCESS_MEMORY_COUNTERS_EX2 layout, also usable with older build SDKs.
+struct TIPS_MEMORY_COUNTERS_EX2
+{
+	PROCESS_MEMORY_COUNTERS_EX base;
+	SIZE_T PrivateWorkingSetSize;
+	ULONG64 SharedCommitUsage;
+};
+static_assert(FIELD_OFFSET(TIPS_MEMORY_COUNTERS_EX2, PrivateWorkingSetSize) == sizeof(PROCESS_MEMORY_COUNTERS_EX),
+	"Unexpected extended memory counters layout");
 
 void FreeTipsProcessBuffers()
 {
@@ -366,6 +381,11 @@ void FreeTipsProcessBuffers()
 		hTipsPsapiModule = NULL;
 	}
 	pTipsGetProcessMemoryInfo = NULL;
+	pTipsQueryWorkingSet = NULL;
+	if (pTipsWorkingSet)
+		HeapFree(GetProcessHeap(), 0, pTipsWorkingSet);
+	pTipsWorkingSet = NULL;
+	cbTipsWorkingSet = 0;
 }
 
 void RequestTipsProcessRefresh()
@@ -3189,24 +3209,85 @@ void GetTrafficStr(WCHAR* sz, ULONG64 uByte, BOOL bBit, int iUnit)
 		lstrlwr(sz, lstrlen(sz));
 }
 
-void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD pid, POINT cursor, COLORREF color)
+static void GetTipsProcessActionRects(const RECT& row, const RECT& client, BOOL memoryRow, RECT* path, RECT* terminate)
+{
+	*path = row;
+	*terminate = row;
+	path->left = memoryRow ? client.right * 32 / 100 : client.right * 100 / 178;
+	path->right = memoryRow ? client.right * 39 / 100 : client.right * 100 / 156;
+	terminate->left = path->right;
+	terminate->right = memoryRow ? client.right * 43 / 100 : client.right * 100 / 145;
+}
+
+void DrawTipsProcessActions(HDC dc, const RECT& row, const RECT& client, DWORD pid, POINT cursor, COLORREF color, BOOL memoryRow)
 {
 	if (pid == 0)
 		return;
-	WCHAR text[16];
-	RECT action = row;
-	action.left = client.right * 100 / 145;
-	action.right = client.right * 100 / 122;
-	wsprintf(text, L"%u", pid);
-	DrawText(dc, text, lstrlen(text), &action, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	action.left = client.right * 100 / 156;
-	action.right = client.right * 100 / 145;
-	SetTextColor(dc, PtInRect(&action, cursor) ? RGB(255, 255, 255) : color);
-	DrawText(dc, L"X", 1, &action, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	action.left = client.right * 100 / 178;
-	action.right = client.right * 100 / 156;
-	SetTextColor(dc, PtInRect(&action, cursor) ? RGB(255, 255, 255) : color);
-	DrawText(dc, L"路径", 2, &action, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	if (!memoryRow)
+	{
+		WCHAR text[16];
+		RECT id = row;
+		id.left = client.right * 100 / 145;
+		id.right = client.right * 100 / 122;
+		wsprintf(text, L"%u", pid);
+		DrawText(dc, text, lstrlen(text), &id, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	}
+	RECT path, terminate;
+	GetTipsProcessActionRects(row, client, memoryRow, &path, &terminate);
+	SetTextColor(dc, PtInRect(&terminate, cursor) ? RGB(255, 255, 255) : color);
+	DrawText(dc, L"X", 1, &terminate, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+	SetTextColor(dc, PtInRect(&path, cursor) ? RGB(255, 255, 255) : color);
+	DrawText(dc, L"路径", 2, &path, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+static void DrawTipsMemoryRow(HDC dc, const RECT& row, const RECT& client, const PROCESSMEMORYUSAGE* item, POINT cursor)
+{
+	const COLORREF color = RGB(0, 192, 192);
+	const int columns[] = { 43, 62, 81, 100 };
+	const WCHAR* titles[] = { L"专用工作集", L"共享工作集", L"总工作集" };
+	SetTextColor(dc, color);
+	RECT name = row;
+	name.left = 5;
+	name.right = client.right * 32 / 100 - 3;
+	if (!item || item->dwProcessID)
+	{
+		const WCHAR* text = item ? item->szExe : L"进程";
+		DrawText(dc, text, lstrlen(text), &name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+		ULONGLONG values[3] = { 0, 0, 0 };
+		if (item)
+		{
+			values[0] = item->privateWorkingSet;
+			values[1] = item->sharedWorkingSet;
+			values[2] = item->totalWorkingSet;
+		}
+		for (int i = 0; i < 3; ++i)
+		{
+			RECT cell = row;
+			cell.left = client.right * columns[i] / 100 + 3;
+			cell.right = client.right * columns[i + 1] / 100 - 3;
+			if (!item)
+				DrawText(dc, titles[i], lstrlen(titles[i]), &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+			else
+			{
+				WCHAR text[32];
+				BOOL gigabytes = values[i] >= 1048576000;
+				ULONGLONG unit = gigabytes ? 1073741824 : 1048576;
+				ULONGLONG whole = values[i] / unit;
+				DWORD fraction = (DWORD)((values[i] % unit) * 100 / unit);
+				wsprintf(text, L"%I64u.%.2u%s", whole, fraction, gigabytes ? L"GB" : L"MB");
+				DrawText(dc, text, lstrlen(text), &cell, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+			}
+		}
+		if (item)
+			DrawTipsProcessActions(dc, row, client, item->dwProcessID, cursor, color, TRUE);
+	}
+	const int dividers[] = { 32, 39, 43, 62, 81 };
+	for (int i = 0; i < ARRAYSIZE(dividers); ++i)
+	{
+		int x = client.right * dividers[i] / 100;
+		MoveToEx(dc, x, row.top, NULL);
+		LineTo(dc, x, row.bottom);
+	}
 }
 
 void DrawTipsTrafficRow(HDC dc, RECT row, const RECT& client, const TRAFFIC& item, const TRAYSAVE& settings)
@@ -3333,7 +3414,8 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 	POINT cursor;
 	GetCursorPos(&cursor);
 	ScreenToClient(window, &cursor);
-	int totalRows = trafficRows + cpuRows + memoryRows;
+	int memoryHeaderRows = memoryRows > 0 ? 1 : 0;
+	int totalRows = trafficRows + cpuRows + memoryHeaderRows + memoryRows;
 	int visibleRows = (int)settings.TipsVisibleRows;
 	HBRUSH alternate = CreateSolidBrush(RGB(24, 24, 24));
 	HPEN divider = CreatePen(PS_DOT, 1, RGB(98, 98, 98));
@@ -3378,40 +3460,25 @@ BOOL PaintTaskTips(HWND window, HDC target, const TRAFFIC* trafficData, int traf
 					int usage = int(item.fCpuUsage * 100);
 					wsprintf(text, L"%d.%.2d%%", usage / 100, usage % 100);
 					DrawText(buffer, text, lstrlen(text), &row, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					DrawTipsProcessActions(buffer, row, client, item.dwProcessID, cursor, color);
+					DrawTipsProcessActions(buffer, row, client, item.dwProcessID, cursor, color, FALSE);
 				}
 			}
 			else
 			{
-				COLORREF color = RGB(0, 192, 192);
-				SetTextColor(buffer, color);
-				const PROCESSMEMORYUSAGE& item = memoryProcesses[processRow - cpuRows];
-				if (item.dwProcessID)
-				{
-					DrawText(buffer, item.szExe, lstrlen(item.szExe), &row, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-					WCHAR text[32];
-					if (item.dwMemUsage >= 1048576000)
-					{
-						DWORD usage = (DWORD)(item.dwMemUsage * 100 / 1073741824);
-						wsprintf(text, L"%u.%.2uGB", usage / 100, usage % 100);
-					}
-					else
-					{
-						DWORD usage = (DWORD)(item.dwMemUsage * 100 / 1048576);
-						wsprintf(text, L"%u.%.2uMB", usage / 100, usage % 100);
-					}
-					DrawText(buffer, text, lstrlen(text), &row, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-					DrawTipsProcessActions(buffer, row, client, item.dwProcessID, cursor, color);
-				}
+				int memoryIndex = processRow - cpuRows - memoryHeaderRows;
+				DrawTipsMemoryRow(buffer, row, client, memoryIndex < 0 ? NULL : &memoryProcesses[memoryIndex], cursor);
 			}
-			MoveToEx(buffer, client.right * 100 / 122, row.top, NULL);
-			LineTo(buffer, client.right * 100 / 122, row.bottom);
-			MoveToEx(buffer, client.right * 100 / 145, row.top, NULL);
-			LineTo(buffer, client.right * 100 / 145, row.bottom);
-			MoveToEx(buffer, client.right * 100 / 156, row.top, NULL);
-			LineTo(buffer, client.right * 100 / 156, row.bottom);
-			MoveToEx(buffer, client.right * 100 / 178, row.top, NULL);
-			LineTo(buffer, client.right * 100 / 178, row.bottom);
+			if (processRow < cpuRows)
+			{
+				MoveToEx(buffer, client.right * 100 / 122, row.top, NULL);
+				LineTo(buffer, client.right * 100 / 122, row.bottom);
+				MoveToEx(buffer, client.right * 100 / 145, row.top, NULL);
+				LineTo(buffer, client.right * 100 / 145, row.bottom);
+				MoveToEx(buffer, client.right * 100 / 156, row.top, NULL);
+				LineTo(buffer, client.right * 100 / 156, row.bottom);
+				MoveToEx(buffer, client.right * 100 / 178, row.top, NULL);
+				LineTo(buffer, client.right * 100 / 178, row.bottom);
+			}
 		}
 		if (logical == trafficRows - 1 || logical == trafficRows + cpuRows - 1)
 		{
@@ -3509,7 +3576,8 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		memoryRows = 0;
 	if (visibleRows < 4 || visibleRows > 30)
 		visibleRows = 13;
-	int totalRows = trafficRows + cpuRows + memoryRows;
+	int memoryHeaderRows = memoryRows > 0 ? 1 : 0;
+	int totalRows = trafficRows + cpuRows + memoryHeaderRows + memoryRows;
 	int maxScroll = totalRows > visibleRows ? totalRows - visibleRows : 0;
 	if (scrollOffset > maxScroll)
 		scrollOffset = maxScroll;
@@ -3549,15 +3617,17 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 		POINT pt;
 		pt.x = GET_X_LPARAM(lParam);
 		pt.y = GET_Y_LPARAM(lParam);
-		RECT rc;
-		GetClientRect(hDlg, &rc);
-		rc.top = 0;
-		rc.bottom = visibleRows * wTipsHeight;
-		rc.left = rc.right * 100 / 178;
-		rc.right = rc.right * 100 / 145;
+		RECT client;
+		GetClientRect(hDlg, &client);
+		RECT row = { 0, 0, client.right, visibleRows * wTipsHeight };
 		int logicalRow = wTipsHeight > 0 ? scrollOffset + pt.y / wTipsHeight : -1;
-		BOOL processRow = logicalRow >= trafficRows && logicalRow < totalRows;
-		BOOL hoverActions = processRow && PtInRect(&rc, pt);
+		int memoryStart = trafficRows + cpuRows + memoryHeaderRows;
+		BOOL memoryRow = logicalRow >= memoryStart;
+		BOOL processRow = (logicalRow >= trafficRows && logicalRow < trafficRows + cpuRows) ||
+			(memoryRow && logicalRow < totalRows);
+		RECT path, terminate;
+		GetTipsProcessActionRects(row, client, memoryRow, &path, &terminate);
+		BOOL hoverActions = processRow && (PtInRect(&path, pt) || PtInRect(&terminate, pt));
 		if (hoverActions || inTipsProcessX)
 			::InvalidateRect(hDlg, NULL, TRUE);
 		inTipsProcessX = hoverActions;
@@ -3632,22 +3702,21 @@ INT_PTR CALLBACK TaskTipsProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 				RunProcess(NULL, szNetCpl);
 				return TRUE;
 			}
-			RECT rc;
-			GetClientRect(hDlg, &rc);
-			rc.left = rc.right * 100 / 178;
-			rc.right = rc.right * 100 / 145;
-			if (PtInRect(&rc, pt))
-			{				
-				int processRow = logicalRow - trafficRows;
-				DWORD pid = 0;
-				if (processRow < cpuRows)
-					pid = cpuProcesses[processRow].dwProcessID;
-				else
-					pid = memoryProcesses[processRow - cpuRows].dwProcessID;
+			int processRow = logicalRow - trafficRows;
+			if (memoryHeaderRows && processRow == cpuRows)
+				return TRUE;
+			BOOL memoryRow = processRow >= cpuRows + memoryHeaderRows;
+			RECT client;
+			GetClientRect(hDlg, &client);
+			RECT path, terminate;
+			GetTipsProcessActionRects(client, client, memoryRow, &path, &terminate);
+			if (PtInRect(&path, pt) || PtInRect(&terminate, pt))
+			{
+				DWORD pid = memoryRow ? memoryProcesses[processRow - cpuRows - memoryHeaderRows].dwProcessID
+					: cpuProcesses[processRow].dwProcessID;
 				if (pid == 0)
 					return TRUE;
-				rc.left = rc.right * 145 / 156;
-				if (PtInRect(&rc, pt))
+				if (PtInRect(&terminate, pt))
 				{
 					HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
 					if (hProc)
@@ -3754,29 +3823,96 @@ static BOOL EnsureTipsMemoryApi()
 	return pTipsGetProcessMemoryInfo != NULL;
 }
 
-static BOOL QueryTipsPrivateBytes(HANDLE process, SIZE_T* bytes)
+static BOOL QueryTipsWorkingSet(DWORD pid, HANDLE process, SIZE_T* privateBytes, SIZE_T* sharedBytes)
 {
-	if (!process || !bytes || !EnsureTipsMemoryApi())
+	if (!process || !privateBytes || !sharedBytes)
 		return FALSE;
-	// System Informer PHPRTLC_PRIVATEBYTES uses VmCounters.PagefileUsage.
-	// PrivateUsage is documented as the same commit-charge value.
-	PROCESS_MEMORY_COUNTERS_EX counters;
-	ZeroMemory(&counters, sizeof(counters));
-	counters.cb = sizeof(counters);
-	if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)))
+	if (EnsureTipsMemoryApi())
 	{
-		*bytes = (SIZE_T)counters.PrivateUsage;
-		if (*bytes == 0)
-			*bytes = counters.PagefileUsage;
-		return TRUE;
+		TIPS_MEMORY_COUNTERS_EX2 counters;
+		ZeroMemory(&counters, sizeof(counters));
+		counters.base.cb = sizeof(counters);
+		// Older systems may accept the buffer without writing the EX2 extension.
+		counters.PrivateWorkingSetSize = (SIZE_T)-1;
+		if (pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&counters, sizeof(counters)) &&
+			counters.PrivateWorkingSetSize <= counters.base.WorkingSetSize)
+		{
+			*privateBytes = counters.PrivateWorkingSetSize;
+			*sharedBytes = counters.base.WorkingSetSize - counters.PrivateWorkingSetSize;
+			return TRUE;
+		}
 	}
-	PROCESS_MEMORY_COUNTERS basic;
-	ZeroMemory(&basic, sizeof(basic));
-	basic.cb = sizeof(basic);
-	if (!pTipsGetProcessMemoryInfo(process, (PPROCESS_MEMORY_COUNTERS)&basic, sizeof(basic)))
+	if (!pTipsQueryWorkingSet)
+	{
+		HMODULE kernel = GetModuleHandle(L"kernel32.dll");
+		if (kernel)
+			pTipsQueryWorkingSet = (pfnTipsQueryWorkingSet)GetProcAddress(kernel, "K32QueryWorkingSet");
+		if (!pTipsQueryWorkingSet)
+		{
+			if (!hTipsPsapiModule)
+				hTipsPsapiModule = LoadLibrary(L"psapi.dll");
+			if (hTipsPsapiModule)
+				pTipsQueryWorkingSet = (pfnTipsQueryWorkingSet)GetProcAddress(hTipsPsapiModule, "QueryWorkingSet");
+		}
+	}
+	if (!pTipsQueryWorkingSet)
 		return FALSE;
-	*bytes = basic.PagefileUsage;
-	return TRUE;
+	// QueryWorkingSet requires stronger rights than GetProcessMemoryInfo.
+	HANDLE queryProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+	if (!queryProcess)
+		return FALSE;
+	BOOL result = FALSE;
+	DWORD needed = cbTipsWorkingSet ? cbTipsWorkingSet : 64 * 1024;
+	for (int attempt = 0; attempt < 4; ++attempt)
+	{
+		if (needed > cbTipsWorkingSet)
+		{
+			void* resized = pTipsWorkingSet
+				? HeapReAlloc(GetProcessHeap(), 0, pTipsWorkingSet, needed)
+				: HeapAlloc(GetProcessHeap(), 0, needed);
+			if (!resized)
+				break;
+			pTipsWorkingSet = (PSAPI_WORKING_SET_INFORMATION*)resized;
+			cbTipsWorkingSet = needed;
+		}
+		pTipsWorkingSet->NumberOfEntries = 0;
+		if (pTipsQueryWorkingSet(queryProcess, pTipsWorkingSet, cbTipsWorkingSet))
+		{
+			ULONG_PTR entries = pTipsWorkingSet->NumberOfEntries;
+			if (entries > (cbTipsWorkingSet - sizeof(ULONG_PTR)) / sizeof(PSAPI_WORKING_SET_BLOCK))
+				break;
+			SYSTEM_INFO info;
+			GetSystemInfo(&info);
+			if (!info.dwPageSize || entries > (SIZE_T)-1 / info.dwPageSize)
+				break;
+			SIZE_T privatePages = 0;
+			for (ULONG_PTR i = 0; i < entries; ++i)
+			{
+				if (!pTipsWorkingSet->WorkingSetInfo[i].Shared)
+					++privatePages;
+			}
+			// Shared means sharable resident pages, including pages with one user.
+			*privateBytes = privatePages * info.dwPageSize;
+			*sharedBytes = (entries - privatePages) * info.dwPageSize;
+			result = TRUE;
+			break;
+		}
+		if (GetLastError() != ERROR_BAD_LENGTH)
+			break;
+		ULONGLONG entries = pTipsWorkingSet->NumberOfEntries;
+		ULONGLONG maxEntries = (MAXDWORD - sizeof(ULONG_PTR)) / sizeof(PSAPI_WORKING_SET_BLOCK);
+		// Reserve some slack for a working set that grows between attempts.
+		if (entries >= maxEntries)
+			break;
+		entries += entries / 4 + 256;
+		if (entries > maxEntries)
+			break;
+		needed = (DWORD)(sizeof(ULONG_PTR) + entries * sizeof(PSAPI_WORKING_SET_BLOCK));
+		if (needed <= cbTipsWorkingSet)
+			break;
+	}
+	CloseHandle(queryProcess);
+	return result;
 }
 
 static BOOL EnsureTipsAccumCapacity(int needed)
@@ -3838,14 +3974,15 @@ static TIPS_PROCESS_ACCUM* AddOrGetTipsAccum(const WCHAR* exe, int* count)
 	return item;
 }
 
-static void InsertTipsMemoryRow(int limit, DWORD pid, SIZE_T mem, const WCHAR* exe)
+static void InsertTipsMemoryRow(int limit, DWORD pid, ULONGLONG privateBytes, ULONGLONG sharedBytes, const WCHAR* exe)
 {
-	if (limit < 1 || mem == 0 || !exe)
+	ULONGLONG totalBytes = privateBytes + sharedBytes;
+	if (limit < 1 || totalBytes == 0 || !exe)
 		return;
 	int insertAt = -1;
 	for (int i = 0; i < limit; ++i)
 	{
-		if (mem >= ppmuWork[i]->dwMemUsage)
+		if (totalBytes >= ppmuWork[i]->totalWorkingSet)
 		{
 			insertAt = i;
 			break;
@@ -3858,7 +3995,9 @@ static void InsertTipsMemoryRow(int limit, DWORD pid, SIZE_T mem, const WCHAR* e
 		ppmuWork[i] = ppmuWork[i - 1];
 	ppmuWork[insertAt] = recycled;
 	recycled->dwProcessID = pid;
-	recycled->dwMemUsage = mem;
+	recycled->privateWorkingSet = privateBytes;
+	recycled->sharedWorkingSet = sharedBytes;
+	recycled->totalWorkingSet = totalBytes;
 	lstrcpyn(recycled->szExe, exe, ARRAYSIZE(recycled->szExe));
 }
 
@@ -3938,10 +4077,10 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 			HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 			if (processHandle)
 			{
-				SIZE_T privateBytes = 0;
+				SIZE_T privateBytes = 0, sharedBytes = 0;
 				BOOL haveMemory = FALSE;
 				if (memoryLimit > 0)
-					haveMemory = QueryTipsPrivateBytes(processHandle, &privateBytes);
+					haveMemory = QueryTipsWorkingSet(pid, processHandle, &privateBytes, &sharedBytes);
 				float usage = 0;
 				BOOL haveCpu = FALSE;
 				if (cpuLimit > 0 && pid != currentProcessId)
@@ -3977,18 +4116,20 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 						pProcessTime[timeIndex].dwSeenCycle = sampleCycle;
 					}
 				}
-				if ((haveMemory && privateBytes > 0) || (haveCpu && usage > 0))
+				if ((haveMemory && (privateBytes > 0 || sharedBytes > 0)) || (haveCpu && usage > 0))
 				{
 					TIPS_PROCESS_ACCUM* item = AddOrGetTipsAccum(process.szExeFile, &accumCount);
 					if (item)
 					{
-						if (haveMemory && privateBytes > 0)
+						if (haveMemory && (privateBytes > 0 || sharedBytes > 0))
 						{
-							SIZE_T next = item->dwMemUsage + privateBytes;
-							item->dwMemUsage = next < item->dwMemUsage ? (SIZE_T)-1 : next;
-							if (privateBytes >= item->memoryPidUsage)
+							// Same-name processes remain grouped; shared pages may repeat across them.
+							item->privateWorkingSet += privateBytes;
+							item->sharedWorkingSet += sharedBytes;
+							SIZE_T totalBytes = privateBytes + sharedBytes;
+							if (totalBytes >= item->memoryPidUsage)
 							{
-								item->memoryPidUsage = privateBytes;
+								item->memoryPidUsage = totalBytes;
 								item->memoryPid = pid;
 							}
 						}
@@ -4022,7 +4163,7 @@ BOOL CollectTipsProcessUsage(int memoryLimit, int cpuLimit)
 	for (int i = 0; i < accumCount; ++i)
 	{
 		const TIPS_PROCESS_ACCUM* item = &pTipsProcessAccum[i];
-		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->dwMemUsage, item->szExe);
+		InsertTipsMemoryRow(memoryLimit, item->memoryPid, item->privateWorkingSet, item->sharedWorkingSet, item->szExe);
 		InsertTipsCpuRow(cpuLimit, item->cpuPid, item->fCpuUsage, item->szExe);
 	}
 	return cpuLimit < 1 ? TRUE : hadCpuDelta;
